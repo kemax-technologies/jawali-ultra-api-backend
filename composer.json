@@ -1,0 +1,12 @@
+{
+    "name": "jawali/ultra-api",
+    "description": "Jawali Ultra — Backend API (PHP + PostgreSQL/Supabase)",
+    "type": "project",
+    "require": {
+        "php": ">=8.2",
+        "ext-pdo": "*",
+        "ext-pdo_pgsql": "*",
+        "ext-json": "*",
+        "ext-mbstring": "*"
+    }
+}

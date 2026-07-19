@@ -1,0 +1,22 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Jawali Ultra API — Apache Config
+# ─────────────────────────────────────────────────────────────────────────────
+
+# تمرير ترويسة Authorization إلى PHP (مهم لـ JWT)
+RewriteEngine On
+RewriteCond %{HTTP:Authorization} ^(.*)
+RewriteRule .* - [E=HTTP_AUTHORIZATION:%1]
+
+# منع وصول غير مرخص للملفات الحساسة
+<FilesMatch "^(_db\.php|\.env|composer\.(json|lock))$">
+    Order allow,deny
+    Deny from all
+</FilesMatch>
+
+# ضغط الردود
+<IfModule mod_deflate.c>
+    AddOutputFilterByType DEFLATE application/json text/plain text/html
+</IfModule>
+
+# ترميز افتراضي
+AddDefaultCharset UTF-8

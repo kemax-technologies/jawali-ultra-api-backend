@@ -1,0 +1,181 @@
+<?php
+/**
+ * ─────────────────────────────────────────────────────────────────────────────
+ * 💳 Jawali Ultra — API الذمم المالية والديون
+ * تسعير مزدوج (ر.ي + دولار) مع تتبع المدفوعات والاستحقاقات
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * Endpoints:
+ *   GET    /credits.php                       — قائمة كل الذمم
+ *   GET    /credits.php?id=CR-XXX             — قيد محدد
+ *   GET    /credits.php?customer=770000001    — كل ديون عميل
+ *   GET    /credits.php?status=مفتوح          — تصفية بالحالة
+ *   GET    /credits.php?overdue=1             — الذمم المتأخرة فقط
+ *   GET    /credits.php?summary=1             — ملخص إحصائي
+ *   POST   /credits.php                       — إنشاء قيد دَين جديد
+ *   PUT    /credits.php?id=CR-XXX             — تحديث القيد
+ *   DELETE /credits.php?id=CR-XXX             — حذف القيد (مدير فقط)
+ */
+
+require_once __DIR__ . '/_db.php';
+
+$method = $_SERVER['REQUEST_METHOD'];
+$pdo    = db();
+
+switch ($method) {
+    // ─────────────────────────────────────────────────────────────────────────
+    // GET — جلب الذمم
+    // ─────────────────────────────────────────────────────────────────────────
+    case 'GET': {
+        // ✅ إصلاح #5: حماية GET بالمصادقة
+        require_auth();
+        // ملخص إحصائي
+        if (isset($_GET['summary'])) {
+            $row = $pdo->query("
+                SELECT
+                  COUNT(*)                        AS total_credits,
+                  SUM(amount_yer)                 AS total_amount_yer,
+                  SUM(amount_usd)                 AS total_amount_usd,
+                  SUM(paid_yer)                   AS total_paid_yer,
+                  SUM(paid_usd)                   AS total_paid_usd,
+                  SUM(amount_yer - paid_yer)      AS total_remaining_yer,
+                  SUM(amount_usd - paid_usd)      AS total_remaining_usd,
+                  SUM(CASE WHEN (amount_yer - paid_yer) > 0.01 THEN 1 ELSE 0 END) AS open_count,
+                  SUM(CASE WHEN due_date IS NOT NULL AND due_date < NOW()
+                              AND (amount_yer - paid_yer) > 0.01 THEN 1 ELSE 0 END) AS overdue_count
+                FROM credits
+            ")->fetch();
+            json_ok($row ?: []);
+        }
+
+        // قيد محدد بالـ ID
+        if (!empty($_GET['id'])) {
+            $stmt = $pdo->prepare('SELECT * FROM credits WHERE id = ? LIMIT 1');
+            $stmt->execute([$_GET['id']]);
+            $credit = $stmt->fetch();
+            if (!$credit) json_error('القيد غير موجود', 404);
+            // إرفاق سجل الدفعات
+            $pmts = $pdo->prepare('SELECT * FROM credit_payments WHERE credit_id = ? ORDER BY date DESC');
+            $pmts->execute([$_GET['id']]);
+            $credit['payments'] = $pmts->fetchAll();
+            json_ok($credit);
+        }
+
+        // فلاتر متعددة
+        $sql  = 'SELECT * FROM credits WHERE 1=1';
+        $args = [];
+        if (!empty($_GET['customer'])) {
+            $sql .= ' AND customer_phone = ?';
+            $args[] = $_GET['customer'];
+        }
+        if (!empty($_GET['invoice'])) {
+            $sql .= ' AND invoice_id = ?';
+            $args[] = $_GET['invoice'];
+        }
+        if (!empty($_GET['status'])) {
+            $sql .= ' AND status = ?';
+            $args[] = $_GET['status'];
+        }
+        if (!empty($_GET['overdue'])) {
+            $sql .= ' AND due_date IS NOT NULL AND due_date < NOW() AND (amount_yer - paid_yer) > 0.01';
+        }
+        if (!empty($_GET['open'])) {
+            $sql .= ' AND (amount_yer - paid_yer) > 0.01';
+        }
+        $sql .= ' ORDER BY date DESC LIMIT 1000';
+
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute($args);
+        json_ok($stmt->fetchAll());
+        break;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // POST — إنشاء قيد دَين جديد (عند البيع الآجل)
+    // ─────────────────────────────────────────────────────────────────────────
+    case 'POST': {
+        require_auth();
+        $body = input_json();
+
+        $id            = $body['id']            ?? ('CR-' . round(microtime(true) * 1000));
+        $customerPhone = trim($body['customer_phone'] ?? $body['customerPhone'] ?? '');
+        $invoiceId     = trim($body['invoice_id']     ?? $body['invoiceId']     ?? '');
+        $amountYer     = (float)($body['amount_yer']  ?? $body['amountYer']    ?? 0);
+        $exchangeRate  = (float)($body['exchange_rate'] ?? $body['exchangeRate'] ?? 530);
+        $amountUsd     = (float)($body['amount_usd']  ?? $body['amountUsd']
+                          ?? ($exchangeRate > 0 ? $amountYer / $exchangeRate : 0));
+        $dueDate       = $body['due_date']  ?? $body['dueDate']  ?? null;
+        $notes         = $body['notes']     ?? '';
+        $status        = $body['status']    ?? 'مفتوح';
+
+        if ($customerPhone === '' || $invoiceId === '' || $amountYer <= 0) {
+            json_error('customer_phone و invoice_id و amount_yer مطلوبة');
+        }
+
+        // ✅ تحويل PostgreSQL: ON DUPLICATE KEY UPDATE ... VALUES(col)
+        //    → ON CONFLICT (id) DO UPDATE SET ... = EXCLUDED.col
+        $stmt = $pdo->prepare(
+            'INSERT INTO credits
+               (id, customer_phone, invoice_id, amount_yer, amount_usd, exchange_rate,
+                paid_yer, paid_usd, status, date, due_date, notes)
+             VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?, NOW(), ?, ?)
+             ON CONFLICT (id) DO UPDATE SET
+                amount_yer    = EXCLUDED.amount_yer,
+                amount_usd    = EXCLUDED.amount_usd,
+                exchange_rate = EXCLUDED.exchange_rate,
+                status        = EXCLUDED.status,
+                due_date      = EXCLUDED.due_date,
+                notes         = EXCLUDED.notes'
+        );
+        $stmt->execute([
+            $id, $customerPhone, $invoiceId,
+            $amountYer, $amountUsd, $exchangeRate,
+            $status, $dueDate, $notes,
+        ]);
+        audit("create credit $id for $customerPhone amount=$amountYer YER");
+        json_ok(['success' => true, 'id' => $id]);
+        break;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // PUT — تحديث قيد (تاريخ الاستحقاق، الملاحظات، الحالة)
+    // ─────────────────────────────────────────────────────────────────────────
+    case 'PUT': {
+        require_auth();
+        $id = $_GET['id'] ?? '';
+        if ($id === '') json_error('id مطلوب');
+        $body = input_json();
+        $sets = [];
+        $args = [];
+        foreach (['due_date' => 'due_date', 'dueDate' => 'due_date',
+                  'notes' => 'notes', 'status' => 'status'] as $k => $col) {
+            if (array_key_exists($k, $body)) {
+                $sets[] = "$col = ?";
+                $args[] = $body[$k];
+            }
+        }
+        if (!$sets) json_error('لا توجد حقول للتحديث');
+        $args[] = $id;
+        $stmt = $pdo->prepare('UPDATE credits SET ' . implode(', ', $sets) . ' WHERE id = ?');
+        $stmt->execute($args);
+        audit("update credit $id");
+        json_ok(['success' => true]);
+        break;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // DELETE — حذف قيد (للمدير فقط)
+    // ─────────────────────────────────────────────────────────────────────────
+    case 'DELETE': {
+        require_admin();
+        $id = $_GET['id'] ?? '';
+        if ($id === '') json_error('id مطلوب');
+        $pdo->prepare('DELETE FROM credits WHERE id = ?')->execute([$id]);
+        audit("delete credit $id", null, 'warning');
+        json_ok(['success' => true]);
+        break;
+    }
+
+    default:
+        json_error('Method Not Allowed', 405);
+}
