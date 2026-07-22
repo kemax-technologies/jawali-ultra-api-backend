@@ -18,6 +18,8 @@
  */
 require_once __DIR__ . '/_db.php';
 require_once __DIR__ . '/_rate_limit.php';
+require_once __DIR__ . '/_notify.php';
+require_once __DIR__ . '/_supabase.php';
 
 $action = $_GET['action'] ?? '';
 $method = $_SERVER['REQUEST_METHOD'];
@@ -55,32 +57,30 @@ function pw_strength_check(string $p): ?string {
     return null;
 }
 
-// ─── إرسال البريد الإلكتروني (يجب ربطها بـ SMTP فعلي) ────────────────────────
+// ─── إرسال البريد الإلكتروني الحقيقي (SendGrid — انظر _notify.php) ───────────
 function send_recovery_email(string $email, string $code, string $token, string $name): bool {
-    $subject = '=?UTF-8?B?' . base64_encode('استعادة كلمة المرور — Jawali Ultra') . '?=';
+    $subject = 'استعادة كلمة المرور — Jawali Ultra';
     $body = "مرحباً $name،\n\n"
           . "تلقّينا طلباً لاستعادة كلمة مرور حسابك في Jawali Ultra.\n\n"
           . "🔑 رمز التحقق: $code\n"
           . "صالح لمدة 15 دقيقة.\n\n"
           . "إذا لم تطلب هذا، تجاهل الرسالة وسيظل حسابك آمناً.\n\n"
           . "— فريق Jawali Ultra";
+    $html = '<div dir="rtl" style="font-family:sans-serif">'
+          . "<p>مرحباً $name،</p>"
+          . '<p>تلقّينا طلباً لاستعادة كلمة مرور حسابك في Jawali Ultra.</p>'
+          . "<p style=\"font-size:22px;font-weight:bold;\">🔑 رمز التحقق: $code</p>"
+          . '<p>صالح لمدة 15 دقيقة.</p>'
+          . '<p>إذا لم تطلب هذا، تجاهل الرسالة وسيظل حسابك آمناً.</p>'
+          . '<p>— فريق Jawali Ultra</p></div>';
 
-    // 🔧 في بيئة التطوير: تسجيل في log فقط
-    error_log("[Jawali][Recovery] Email to $email => code=$code token=$token");
-
-    $headers = "From: noreply@jawali.local\r\n"
-             . "Content-Type: text/plain; charset=UTF-8\r\n";
-
-    // محاولة إرسال فعلية (تتطلب MTA مضبوطاً) — لا نوقف العملية إن فشلت
-    @mail($email, $subject, $body, $headers);
-    return true;
+    error_log("[Jawali][Recovery] Email to $email => token=$token");
+    return jawali_send_email($email, $subject, $body, $html);
 }
 
-// ─── إرسال SMS الاستعادة ──────────────────────────────────────────────────────
+// ─── إرسال SMS الاستعادة الحقيقي (Twilio — انظر _notify.php) ─────────────────
 function send_recovery_sms(string $phone, string $code): bool {
-    error_log("[Jawali][Recovery] SMS to $phone => code=$code");
-    // 🔧 ربط مزوّد SMS الفعلي هنا
-    return true;
+    return jawali_send_sms($phone, "رمز استعادة كلمة المرور — جوالي: $code (صالح 15 دقيقة)");
 }
 
 // ─── معالجة الإجراءات ─────────────────────────────────────────────────────────
@@ -134,9 +134,16 @@ switch ($action) {
             json_ok($genericResponse);
         }
 
-        // إنشاء رمز OTP عشوائي 6 أرقام (للعرض على المستخدم)
-        $code = str_pad((string)random_int(0, 999999), 6, '0', STR_PAD_LEFT);
-        $codeHash = hash('sha256', $code);
+        // ✅ قناة البريد الإلكتروني: يتولّى Supabase Auth توليد وإرسال رمز OTP
+        // حقيقي فعلياً (عبر SMTP المدمج المجاني في Supabase — بدون أي مزوّد
+        // خارجي). نُخزّن محلياً فقط سنتينل خاص (بدل الكود الحقيقي غير المعروف
+        // لنا) للتحقق من الصلاحية/المحاولات، والتحقق الفعلي من الرمز يتم لاحقاً
+        // عبر supabase_verify_email_otp() في خطوة verify_code.
+        $isEmailChannel = $channel === 'email';
+        $code = $isEmailChannel
+            ? SUPABASE_OTP_SENTINEL
+            : str_pad((string)random_int(0, 999999), 6, '0', STR_PAD_LEFT);
+        $codeHash = $isEmailChannel ? SUPABASE_OTP_SENTINEL : hash('sha256', $code);
 
         // إنشاء توكن طويل (لروابط الاستعادة من البريد)
         $tokenRaw  = bin2hex(random_bytes(32));
@@ -182,8 +189,9 @@ switch ($action) {
         }
 
         // إرسال
-        if ($channel === 'email') {
-            send_recovery_email($identifier, $code, $tokenRaw, $user['name']);
+        if ($isEmailChannel) {
+            // ✅ إرسال حقيقي عبر Supabase Auth (SMTP مجاني مدمج)
+            supabase_send_email_otp($identifier);
         } else {
             send_recovery_sms($identifier, $code);
         }
@@ -191,8 +199,9 @@ switch ($action) {
         log_recovery($identifier, true);
         audit('طلب استعادة كلمة المرور', $identifier);
 
-        // في بيئة التطوير فقط: نُرجع الكود لتسهيل الاختبار
-        if (getenv('JAWALI_DEV_MODE') === '1') {
+        // في بيئة التطوير فقط: نُرجع الكود لتسهيل الاختبار (لا معنى لذلك في
+        // قناة البريد لأن الكود الحقيقي يُصدره Supabase ولا نعرفه محلياً)
+        if (getenv('JAWALI_DEV_MODE') === '1' && !$isEmailChannel) {
             $genericResponse['_dev_code']  = $code;
             $genericResponse['_dev_token'] = $tokenRaw;
         }
@@ -239,7 +248,18 @@ switch ($action) {
                 ->execute([$row['id']]);
             json_error('تجاوزت الحد الأقصى للمحاولات', 429);
         }
-        if (!hash_equals($row['code_hash'], hash('sha256', $code))) {
+
+        $rowIsEmailManaged = $row['code_hash'] === SUPABASE_OTP_SENTINEL;
+        if ($rowIsEmailManaged) {
+            // ✅ قناة البريد: التحقق الفعلي من الرمز يتم عبر Supabase Auth
+            // مباشرة (هو من ولّده وأرسله فعلياً، لا نملك نسخة محلية منه)
+            if (!supabase_verify_email_otp($identifier, $code)) {
+                db()->prepare('UPDATE auth_otp_codes SET attempts=attempts+1 WHERE id=?')
+                    ->execute([$row['id']]);
+                usleep(300000);
+                json_error('الرمز غير صحيح', 401);
+            }
+        } elseif (!hash_equals($row['code_hash'], hash('sha256', $code))) {
             db()->prepare('UPDATE auth_otp_codes SET attempts=attempts+1 WHERE id=?')
                 ->execute([$row['id']]);
             usleep(300000);

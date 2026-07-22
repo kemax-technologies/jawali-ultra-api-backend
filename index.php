@@ -8,7 +8,7 @@ try {
         'app'        => 'Jawali Ultra API',
         'version'    => '9.0 — Credit & Dual Pricing',
         'status'     => 'ready',
-        'mysql'      => $version,
+        'database'   => $version,
         'server_time'=> date('c'),
         'features'   => [
             '💳 نظام البيع بالدَين والذمم المالية',
@@ -54,5 +54,5 @@ try {
     ]);
 } catch (Exception $e) {
     error_log('[Jawali][index] قاعدة البيانات غير متاحة: ' . $e->getMessage());
-    json_error('قاعدة البيانات غير متاحة. تأكد من تشغيل MySQL.', 500);
+    json_error('قاعدة البيانات غير متاحة. تأكد من إعدادات الاتصال بـ Supabase/PostgreSQL.', 500);
 }
