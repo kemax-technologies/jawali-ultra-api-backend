@@ -63,6 +63,21 @@ switch ($action) {
 
         audit('تسجيل دخول', $email);
 
+        // ✅ تسجيل جلسة لوحة المدير الويب (لتتبّع last_seen في admin_sessions)
+        if (($user['role'] ?? '') === 'مدير') {
+            try {
+                db()->prepare(
+                    'INSERT INTO admin_sessions (user_email, token_hash, ip_address, user_agent, expires_at)
+                     VALUES (?, ?, ?, ?, NOW() + INTERVAL \'7 days\')'
+                )->execute([
+                    $email,
+                    hash('sha256', $token),
+                    $ip,
+                    substr($_SERVER['HTTP_USER_AGENT'] ?? '', 0, 240),
+                ]);
+            } catch (Exception $e) { /* الجدول قد لا يكون موجوداً بعد — تجاهل بأمان */ }
+        }
+
         json_ok([
             'success' => true,
             'token'   => $token,
