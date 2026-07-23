@@ -19,7 +19,9 @@ switch ($method) {
         $b     = input_json();
         $name  = trim($b['name']  ?? '');
         $email = strtolower(trim($b['email'] ?? ''));
-        $role  = in_array($b['role'] ?? '', ['مدير', 'كاشير'], true) ? $b['role'] : 'كاشير';
+        // ✅ إصلاح: توحيد الأدوار المسموحة مع ما يدعمه تطبيق الكاشير فعلياً
+        //    (مدير / كاشير / موظف) — كانت "موظف" تتحول بصمت إلى "كاشير"
+        $role  = in_array($b['role'] ?? '', ['مدير', 'كاشير', 'موظف'], true) ? $b['role'] : 'كاشير';
 
         if ($email === '' || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
             json_error('البريد الإلكتروني غير صالح');

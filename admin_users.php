@@ -111,7 +111,9 @@ switch ($method) {
         // ── إنشاء/تحديث (الإجراء الافتراضي) ────────────────────────────────
         $name   = trim($b['name'] ?? '');
         $email  = strtolower(trim($b['email'] ?? ''));
-        $role   = in_array($b['role'] ?? '', ['مدير', 'كاشير'], true) ? $b['role'] : 'كاشير';
+        // ✅ إصلاح: توحيد الأدوار المسموحة مع ما يدعمه تطبيق الكاشير فعلياً
+        //    (مدير / كاشير / موظف) — كانت "موظف" تتحول بصمت إلى "كاشير"
+        $role   = in_array($b['role'] ?? '', ['مدير', 'كاشير', 'موظف'], true) ? $b['role'] : 'كاشير';
         $branch = strtoupper(trim($b['branch_code'] ?? 'MAIN'));
         $active = isset($b['is_active']) ? (int)!!$b['is_active'] : 1;
 
