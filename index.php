@@ -25,6 +25,8 @@ try {
             'expenses.php',
             'suppliers.php',
             'purchases.php',
+            'returns.php',
+            'returns.php?invoice_id={id}',
             'users.php',
             'settings.php',
             'sync.php',
