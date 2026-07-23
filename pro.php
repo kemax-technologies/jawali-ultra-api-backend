@@ -25,13 +25,11 @@
 
 require_once __DIR__ . '/_db.php';
 require_once __DIR__ . '/_rate_limit.php';
+require_once __DIR__ . '/_pro_helpers.php';
 
 $action = $_GET['action'] ?? '';
 $method = $_SERVER['REQUEST_METHOD'];
 $pdo    = db();
-
-// ── مدة كل خطة بالأيام ────────────────────────────────────────────────────────
-const PRO_PLAN_DAYS = ['yearly' => 365, 'monthly' => 30];
 
 // ── تحديث تلقائي: تنزيل حالة Pro عند انتهاء الصلاحية ─────────────────────────
 function pro_autoexpire(PDO $pdo, int $userId): array {
@@ -183,33 +181,11 @@ switch ($action) {
         $requestId = (int)($body['request_id'] ?? 0);
         if ($requestId <= 0) json_error('request_id مطلوب');
 
-        $stmt = $pdo->prepare('SELECT * FROM pro_requests WHERE id = ?');
-        $stmt->execute([$requestId]);
-        $req = $stmt->fetch();
-        if (!$req) json_error('الطلب غير موجود', 404);
-        if ($req['status'] !== 'pending') json_error('تمت مراجعة هذا الطلب مسبقاً', 409);
-
-        $days = PRO_PLAN_DAYS[$req['plan']] ?? 365;
-        $expiresAt = (new DateTime())->modify("+{$days} days")->format('Y-m-d H:i:s');
-
-        $pdo->beginTransaction();
-        try {
-            $pdo->prepare(
-                'UPDATE users SET is_pro = 1, pro_plan = ?, pro_expires_at = ?, pro_activated_at = now()
-                 WHERE id = ?'
-            )->execute([$req['plan'], $expiresAt, $req['user_id']]);
-
-            $pdo->prepare(
-                "UPDATE pro_requests SET status = 'approved', reviewed_by = ?, reviewed_at = now()
-                 WHERE id = ?"
-            )->execute([$admin['email'] ?? '', $requestId]);
-
-            $pdo->commit();
-        } catch (Exception $e) {
-            $pdo->rollBack();
-            error_log('[Jawali][pro.approve] ' . $e->getMessage());
-            json_error('خطأ داخلي في الخادم', 500);
-        }
+        // ✅ تحسين: منطق الموافقة موحّد الآن في _pro_helpers.php ويُستخدم من
+        //    pro.php و dev_pro.php لمنع انحراف التنفيذ بين لوحتي التحكم.
+        $result = pro_approve_request($pdo, $requestId, $admin['email'] ?? '');
+        $req = $result['request'];
+        $expiresAt = $result['expires_at'];
 
         audit("تفعيل Pro للمستخدم {$req['user_email']} (خطة {$req['plan']})", $admin['email'] ?? null);
         json_ok(['success' => true, 'message' => 'تم تفعيل الحساب Pro بنجاح', 'expires_at' => $expiresAt]);
@@ -227,16 +203,7 @@ switch ($action) {
         $reason = trim((string)($body['reason'] ?? 'لم يتم تأكيد التحويل'));
         if ($requestId <= 0) json_error('request_id مطلوب');
 
-        $stmt = $pdo->prepare('SELECT * FROM pro_requests WHERE id = ?');
-        $stmt->execute([$requestId]);
-        $req = $stmt->fetch();
-        if (!$req) json_error('الطلب غير موجود', 404);
-        if ($req['status'] !== 'pending') json_error('تمت مراجعة هذا الطلب مسبقاً', 409);
-
-        $pdo->prepare(
-            "UPDATE pro_requests SET status = 'rejected', reviewed_by = ?, reviewed_at = now(), reject_reason = ?
-             WHERE id = ?"
-        )->execute([$admin['email'] ?? '', $reason, $requestId]);
+        $req = pro_reject_request($pdo, $requestId, $admin['email'] ?? '', $reason);
 
         audit("رفض طلب ترقية Pro للمستخدم {$req['user_email']}", $admin['email'] ?? null);
         json_ok(['success' => true, 'message' => 'تم رفض الطلب']);
