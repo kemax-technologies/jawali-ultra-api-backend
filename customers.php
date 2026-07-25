@@ -38,14 +38,22 @@ switch ($method) {
         if ($phone === '' || $name === '') json_error('الاسم والهاتف مطلوبان');
 
         // ✅ تحويل PostgreSQL: ON DUPLICATE KEY UPDATE → ON CONFLICT DO UPDATE SET
+        // 🆕 حقول القالب الموحّد: العنوان، حد الدين، الرصيد الافتتاحي (مدين/دائن)،
+        // طريقة التواصل، الرقم الضريبي — لمطابقة النظام المرجعي
         $stmt = $pdo->prepare(
-            'INSERT INTO customers (phone, name, email, spent, visits, days_since_last, tier, notes)
-             VALUES (?,?,?,?,?,?,?,?)
+            'INSERT INTO customers (phone, name, email, spent, visits, days_since_last, tier, notes,
+                address, debt_limit, opening_balance, opening_is_debit, messaging_method, tax_id)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
              ON CONFLICT (phone) DO UPDATE SET
                 name = EXCLUDED.name, email = EXCLUDED.email,
                 spent = EXCLUDED.spent, visits = EXCLUDED.visits,
                 days_since_last = EXCLUDED.days_since_last,
-                tier = EXCLUDED.tier, notes = EXCLUDED.notes'
+                tier = EXCLUDED.tier, notes = EXCLUDED.notes,
+                address = EXCLUDED.address, debt_limit = EXCLUDED.debt_limit,
+                opening_balance = EXCLUDED.opening_balance,
+                opening_is_debit = EXCLUDED.opening_is_debit,
+                messaging_method = EXCLUDED.messaging_method,
+                tax_id = EXCLUDED.tax_id'
         );
         $stmt->execute([
             $phone, $name,
@@ -55,6 +63,12 @@ switch ($method) {
             (int)  ($body['daysSinceLastPurchase'] ?? $body['days_since_last'] ?? 0),
             $body['tier']  ?? 'عادي',
             $body['notes'] ?? null,
+            $body['address'] ?? null,
+            (float)($body['debtLimit'] ?? $body['debt_limit'] ?? 0),
+            (float)($body['openingBalance'] ?? $body['opening_balance'] ?? 0),
+            !empty($body['openingIsDebit'] ?? $body['opening_is_debit'] ?? true) ? 1 : 0,
+            $body['messagingMethod'] ?? $body['messaging_method'] ?? 'بدون',
+            $body['taxId'] ?? $body['tax_id'] ?? null,
         ]);
         audit("upsert customer $phone");
         json_ok(['success' => true, 'phone' => $phone]);
