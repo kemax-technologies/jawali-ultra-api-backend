@@ -1,4 +1,18 @@
 <?php
+/**
+ * ─────────────────────────────────────────────────────────────────────────────
+ * 🧾 Jawali Ultra — API الفواتير
+ * ─────────────────────────────────────────────────────────────────────────────
+ * Endpoints:
+ *   GET    /invoices.php                    — قائمة الفواتير (مع فلترة تاريخ)
+ *   GET    /invoices.php?id=INV-XXX         — فاتورة محدّدة
+ *   POST   /invoices.php                    — إنشاء/تحديث فاتورة (upsert)
+ *   POST   /invoices.php?action=cancel&id=… — إلغاء فاتورة (يتطلب صلاحية
+ *          cancelInvoice) — يعكس أثرها على المخزون/الصندوق دون حذف السجل
+ *   DELETE /invoices.php?id=INV-XXX         — حذف نهائي (يتطلب صلاحية
+ *          deleteInvoice) — يُفضَّل تأكيد كلمة مرور مدير على العميل قبل
+ *          الاستدعاء عبر auth.php?action=confirm_admin
+ */
 require_once __DIR__ . '/_db.php';
 
 $method = $_SERVER['REQUEST_METHOD'];
@@ -39,6 +53,40 @@ switch ($method) {
     }
 
     case 'POST': {
+        $action = $_GET['action'] ?? '';
+
+        // ─────────────────────────────────────────────────────────────────
+        // POST ?action=cancel — إلغاء فاتورة (بدون حذف السجل) + عكس أثرها
+        // على المخزون والصندوق النقدي. يتطلب صلاحية "cancelInvoice" الدقيقة.
+        // ─────────────────────────────────────────────────────────────────
+        if ($action === 'cancel') {
+            $auth = require_permission('cancelInvoice');
+            $id = trim($_GET['id'] ?? (input_json()['id'] ?? ''));
+            if ($id === '') json_error('id مطلوب');
+
+            $stmt = $pdo->prepare('SELECT * FROM invoices WHERE id = ? LIMIT 1');
+            $stmt->execute([$id]);
+            $inv = $stmt->fetch();
+            if (!$inv) json_error('الفاتورة غير موجودة', 404);
+            if (($inv['status'] ?? '') === 'ملغاة') {
+                json_error('الفاتورة ملغاة مسبقاً');
+            }
+
+            $pdo->beginTransaction();
+            try {
+                _reverse_invoice_effects($pdo, $inv, $auth['email'] ?? null);
+                $pdo->prepare("UPDATE invoices SET status = 'ملغاة' WHERE id = ?")->execute([$id]);
+                $pdo->commit();
+            } catch (Exception $e) {
+                $pdo->rollBack();
+                error_log('[Jawali][invoices] فشل إلغاء الفاتورة: ' . $e->getMessage());
+                json_error('خطأ داخلي في الخادم', 500);
+            }
+            audit("إلغاء فاتورة $id", $auth['email'] ?? null);
+            json_ok(['success' => true, 'id' => $id, 'status' => 'ملغاة']);
+            break;
+        }
+
         require_auth();
         $body = input_json();
         $id   = trim($body['id'] ?? '');
@@ -146,6 +194,88 @@ switch ($method) {
         break;
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // DELETE ?id=XXX — حذف نهائي لسجل الفاتورة (وبنودها تلقائياً عبر CASCADE)
+    // + عكس أثرها على المخزون/الصندوق إن لم تكن قد أُلغيت مسبقاً بالفعل.
+    // يتطلب صلاحية "deleteInvoice" الدقيقة — عملية حساسة يجب أن يُسبقها على
+    // العميل تأكيد كلمة مرور مدير عبر auth.php?action=confirm_admin.
+    // ─────────────────────────────────────────────────────────────────────────
+    case 'DELETE': {
+        $auth = require_permission('deleteInvoice');
+        $id = trim($_GET['id'] ?? '');
+        if ($id === '') json_error('id مطلوب');
+
+        $stmt = $pdo->prepare('SELECT * FROM invoices WHERE id = ? LIMIT 1');
+        $stmt->execute([$id]);
+        $inv = $stmt->fetch();
+        if (!$inv) json_error('الفاتورة غير موجودة', 404);
+
+        $pdo->beginTransaction();
+        try {
+            // لا نعكس الأثر مرتين إن كانت الفاتورة مُلغاة مسبقاً (عُكس أثرها
+            // بالفعل عند الإلغاء) — نعكسه فقط إن كانت لا تزال "فعّالة"
+            if (($inv['status'] ?? '') !== 'ملغاة') {
+                _reverse_invoice_effects($pdo, $inv, $auth['email'] ?? null);
+            }
+            $pdo->prepare('DELETE FROM invoices WHERE id = ?')->execute([$id]);
+            $pdo->commit();
+        } catch (Exception $e) {
+            $pdo->rollBack();
+            error_log('[Jawali][invoices] فشل حذف الفاتورة: ' . $e->getMessage());
+            json_error('خطأ داخلي في الخادم', 500);
+        }
+        audit("حذف فاتورة $id", $auth['email'] ?? null, 'warning');
+        json_ok(['success' => true, 'id' => $id]);
+        break;
+    }
+
     default:
         json_error('Method Not Allowed', 405);
+}
+
+/**
+ * يعكس أثر فاتورة على المخزون (استرجاع الكميات المخصومة) والصندوق النقدي
+ * (استرجاع المبلغ المضاف + تسجيل حركة عكسية) — تُستخدم من مسارَي الإلغاء
+ * (POST ?action=cancel) والحذف (DELETE) لتجنّب تكرار الكود.
+ */
+function _reverse_invoice_effects(PDO $pdo, array $inv, ?string $byEmail): void {
+    $id           = $inv['id'];
+    $warehouseId  = $inv['warehouse_id']    ?? '';
+    $cashAccountId = $inv['cash_account_id'] ?? '';
+    $paymentMethod = $inv['payment_method']  ?? '';
+    $total         = (float)($inv['total']   ?? 0);
+
+    // استرجاع الكميات إلى المخزون (العام + مخزن محدد إن وُجد)
+    $itemsStmt = $pdo->prepare('SELECT product_sku, base_qty, qty FROM invoice_items WHERE invoice_id = ?');
+    $itemsStmt->execute([$id]);
+    $incStock   = $pdo->prepare('UPDATE products SET stock = stock + ?, sold = GREATEST(0, sold - ?) WHERE sku = ?');
+    $incWhStock = $pdo->prepare('UPDATE warehouse_stock SET stock = stock + ? WHERE warehouse_id = ? AND product_sku = ?');
+    foreach ($itemsStmt->fetchAll() as $it) {
+        $sku     = $it['product_sku'] ?? null;
+        $baseQty = (int)($it['base_qty'] ?? $it['qty'] ?? 0);
+        if (!$sku || $baseQty <= 0) continue;
+        $incStock->execute([$baseQty, $baseQty, $sku]);
+        if ($warehouseId !== '') {
+            $incWhStock->execute([$baseQty, $warehouseId, $sku]);
+        }
+    }
+
+    // استرجاع رصيد الصندوق النقدي (عكس تماماً لما حدث عند إنشاء الفاتورة)
+    if ($cashAccountId !== '' && $paymentMethod !== 'آجل' && $total > 0) {
+        $accStmt = $pdo->prepare('SELECT * FROM cash_accounts WHERE id = ? LIMIT 1');
+        $accStmt->execute([$cashAccountId]);
+        $acc = $accStmt->fetch();
+        if ($acc) {
+            $pdo->prepare('UPDATE cash_accounts SET balance = balance - ? WHERE id = ?')
+                ->execute([$total, $cashAccountId]);
+            $txId = 'TX-' . round(microtime(true) * 1000);
+            $pdo->prepare(
+                'INSERT INTO cash_transactions (id, account_id, type, amount, currency, notes, created_by)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)'
+            )->execute([
+                $txId, $cashAccountId, 'عكس فاتورة (إلغاء/حذف)', -$total, $acc['currency'],
+                "عكس أثر فاتورة $id", $byEmail,
+            ]);
+        }
+    }
 }

@@ -22,7 +22,7 @@ switch ($method) {
     case 'GET': {
         if (isset($_GET['id'])) {
             $stmt = $pdo->prepare(
-                'SELECT u.id, u.name, u.email, u.role, u.is_active, u.branch_code, u.created_at,
+                'SELECT u.id, u.name, u.email, u.role, u.is_active, u.branch_code, u.permissions, u.created_at,
                         b.name AS branch_name
                  FROM users u
                  LEFT JOIN branches b ON b.code = u.branch_code
@@ -31,6 +31,8 @@ switch ($method) {
             $stmt->execute([(int)$_GET['id']]);
             $u = $stmt->fetch();
             if (!$u) json_error('المستخدم غير موجود', 404);
+            $u['effective_permissions'] = effective_permissions((string)$u['role'], $u['permissions']);
+            $u['permissions'] = $u['permissions'] ? json_decode($u['permissions'], true) : null;
 
             // إحصائيات الأداء
             $stats = $pdo->prepare(
@@ -46,7 +48,7 @@ switch ($method) {
         }
 
         $branch = current_branch();
-        $sql = 'SELECT u.id, u.name, u.email, u.role, u.is_active, u.branch_code, u.created_at,
+        $sql = 'SELECT u.id, u.name, u.email, u.role, u.is_active, u.branch_code, u.permissions, u.created_at,
                        b.name AS branch_name,
                        (SELECT COUNT(*)            FROM invoices i WHERE i.user_email=u.email) AS invoices_count,
                        (SELECT COALESCE(SUM(total),0) FROM invoices i WHERE i.user_email=u.email) AS total_sales,
@@ -59,7 +61,12 @@ switch ($method) {
 
         $stmt = $pdo->prepare($sql);
         $stmt->execute($args);
-        json_ok($stmt->fetchAll());
+        $rows = $stmt->fetchAll();
+        foreach ($rows as &$r) {
+            $r['effective_permissions'] = effective_permissions((string)$r['role'], $r['permissions']);
+            $r['permissions'] = $r['permissions'] ? json_decode($r['permissions'], true) : null;
+        }
+        json_ok($rows);
         break;
     }
 
@@ -111,9 +118,8 @@ switch ($method) {
         // ── إنشاء/تحديث (الإجراء الافتراضي) ────────────────────────────────
         $name   = trim($b['name'] ?? '');
         $email  = strtolower(trim($b['email'] ?? ''));
-        // ✅ إصلاح: توحيد الأدوار المسموحة مع ما يدعمه تطبيق الكاشير فعلياً
-        //    (مدير / كاشير / موظف) — كانت "موظف" تتحول بصمت إلى "كاشير"
-        $role   = in_array($b['role'] ?? '', ['مدير', 'كاشير', 'موظف'], true) ? $b['role'] : 'كاشير';
+        // ✅ الأدوار التسعة الكاملة (RBAC)
+        $role   = in_array($b['role'] ?? '', APP_ROLES, true) ? $b['role'] : 'كاشير';
         $branch = strtoupper(trim($b['branch_code'] ?? 'MAIN'));
         $active = isset($b['is_active']) ? (int)!!$b['is_active'] : 1;
 
@@ -122,20 +128,31 @@ switch ($method) {
         }
         if ($name === '') json_error('الاسم مطلوب');
 
+        // 🆕 صلاحيات دقيقة مخصّصة (اختيارية)
+        $permissionsJson = null;
+        if (isset($b['permissions']) && is_array($b['permissions'])) {
+            $filtered = [];
+            foreach ($b['permissions'] as $k => $v) {
+                if (in_array($k, APP_PERMISSIONS, true)) $filtered[$k] = (bool)$v;
+            }
+            $permissionsJson = json_encode($filtered, JSON_UNESCAPED_UNICODE);
+        }
+
         $hash = !empty($b['password'])
             ? password_hash($b['password'], PASSWORD_BCRYPT, ['cost' => 12])
             : null;
 
         // ✅ تحويل PostgreSQL: ON DUPLICATE KEY UPDATE ... VALUES(col) → ON CONFLICT (email) DO UPDATE SET ... EXCLUDED.col
         $stmt = $pdo->prepare(
-            'INSERT INTO users (name, email, password_hash, role, branch_code, is_active)
-             VALUES (?,?,?,?,?,?)
+            'INSERT INTO users (name, email, password_hash, role, branch_code, is_active, permissions)
+             VALUES (?,?,?,?,?,?,?)
              ON CONFLICT (email) DO UPDATE SET
                 name = EXCLUDED.name, role = EXCLUDED.role,
                 branch_code = EXCLUDED.branch_code, is_active = EXCLUDED.is_active,
+                permissions = COALESCE(EXCLUDED.permissions, users.permissions),
                 password_hash = COALESCE(EXCLUDED.password_hash, users.password_hash)'
         );
-        $stmt->execute([$name, $email, $hash, $role, $branch, $active]);
+        $stmt->execute([$name, $email, $hash, $role, $branch, $active, $permissionsJson]);
         audit("upsert user $email (branch=$branch, role=$role)", $auth['email'] ?? null);
         json_ok(['success' => true]);
         break;

@@ -10,8 +10,12 @@ $auth = require_admin();
 switch ($method) {
     case 'GET': {
         $rows = $pdo->query(
-            'SELECT id, name, email, role, is_active, created_at FROM users ORDER BY id DESC'
+            'SELECT id, name, email, role, is_active, permissions, created_at FROM users ORDER BY id DESC'
         )->fetchAll();
+        foreach ($rows as &$r) {
+            $r['effective_permissions'] = effective_permissions((string)$r['role'], $r['permissions']);
+            $r['permissions'] = $r['permissions'] ? json_decode($r['permissions'], true) : null;
+        }
         json_ok($rows);
         break;
     }
@@ -19,9 +23,9 @@ switch ($method) {
         $b     = input_json();
         $name  = trim($b['name']  ?? '');
         $email = strtolower(trim($b['email'] ?? ''));
-        // ✅ إصلاح: توحيد الأدوار المسموحة مع ما يدعمه تطبيق الكاشير فعلياً
-        //    (مدير / كاشير / موظف) — كانت "موظف" تتحول بصمت إلى "كاشير"
-        $role  = in_array($b['role'] ?? '', ['مدير', 'كاشير', 'موظف'], true) ? $b['role'] : 'كاشير';
+        // ✅ الأدوار التسعة الكاملة (RBAC) — أي دور خارج هذه القائمة يتحول
+        // بصمت إلى "كاشير" (الدور الأقل صلاحية والأكثر أماناً كافتراضي)
+        $role = in_array($b['role'] ?? '', APP_ROLES, true) ? $b['role'] : 'كاشير';
 
         if ($email === '' || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
             json_error('البريد الإلكتروني غير صالح');
@@ -31,20 +35,32 @@ switch ($method) {
             ? password_hash($b['password'], PASSWORD_BCRYPT, ['cost' => 12])
             : null;
 
+        // 🆕 صلاحيات دقيقة مخصّصة (اختيارية) — إن أُرسلت override لكل مفتاح
+        // من APP_PERMISSIONS، وإلا تبقى NULL (تُستخدم صلاحيات الدور الافتراضية)
+        $permissionsJson = null;
+        if (isset($b['permissions']) && is_array($b['permissions'])) {
+            $filtered = [];
+            foreach ($b['permissions'] as $k => $v) {
+                if (in_array($k, APP_PERMISSIONS, true)) $filtered[$k] = (bool)$v;
+            }
+            $permissionsJson = json_encode($filtered, JSON_UNESCAPED_UNICODE);
+        }
+
         // ✅ تحويل PostgreSQL: ON DUPLICATE KEY UPDATE ... VALUES(col)
         //    → ON CONFLICT DO UPDATE SET ... = EXCLUDED.col
         //    COALESCE(VALUES(password_hash), users.password_hash) يترجم مباشرة
         //    إلى COALESCE(EXCLUDED.password_hash, users.password_hash) — نفس المنطق
         //    (يحافظ على كلمة المرور القديمة إذا لم تُرسَل كلمة مرور جديدة)
         $stmt = $pdo->prepare(
-            'INSERT INTO users (name, email, password_hash, role)
-             VALUES (?,?,?,?)
+            'INSERT INTO users (name, email, password_hash, role, permissions)
+             VALUES (?,?,?,?,?)
              ON CONFLICT (email) DO UPDATE SET
                 name = EXCLUDED.name, role = EXCLUDED.role,
+                permissions = COALESCE(EXCLUDED.permissions, users.permissions),
                 password_hash = COALESCE(EXCLUDED.password_hash, users.password_hash)'
         );
-        $stmt->execute([$name, $email, $hash, $role]);
-        audit("upsert user $email", $auth['email'] ?? null);
+        $stmt->execute([$name, $email, $hash, $role, $permissionsJson]);
+        audit("upsert user $email (role=$role)", $auth['email'] ?? null);
         json_ok(['success' => true]);
         break;
     }

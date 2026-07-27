@@ -97,6 +97,7 @@ switch ($action) {
             json_error('الموضوع والرسالة مطلوبان');
         }
         if (mb_strlen($subject) > 200) $subject = mb_substr($subject, 0, 200);
+        if (mb_strlen($message) > 4000) $message = mb_substr($message, 0, 4000);
 
         // تحقق هل المستخدم Pro لتحديد الأولوية
         $u = $pdo->prepare('SELECT is_pro FROM users WHERE id = ?');
@@ -197,11 +198,18 @@ switch ($action) {
     case 'reply': {
         if ($method !== 'POST') json_error('استخدم POST', 405);
         $auth = require_auth();
+
+        // ✅ حماية من الإسبام: 30 رداً كحد أقصى كل ساعة لكل مستخدم/آي‌بي
+        // (نفس نمط الحماية المطبَّق في action=create وباقي endpoints الحساسة)
+        $ip = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+        rl_check('support_reply', (string)($auth['email'] ?? $auth['sub']) . '|' . $ip, 30, 3600);
+
         $body = input_json();
         $ticketId = (int)($body['ticket_id'] ?? 0);
         $message  = trim((string)($body['message'] ?? ''));
         if ($ticketId <= 0) json_error('ticket_id مطلوب');
         if ($message === '') json_error('نص الرسالة مطلوب');
+        if (mb_strlen($message) > 4000) $message = mb_substr($message, 0, 4000);
 
         $ticket  = support_load_ticket_for($pdo, $ticketId, $auth);
         $isAdmin = support_is_admin($auth);

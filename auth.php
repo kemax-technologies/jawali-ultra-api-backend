@@ -30,7 +30,7 @@ switch ($action) {
         rl_check('login', $email . '|' . $ip, 5, 900);
 
         $stmt = db()->prepare(
-            'SELECT id, name, email, password_hash, role, is_active FROM users WHERE email = ? LIMIT 1'
+            'SELECT id, name, email, password_hash, role, is_active, permissions FROM users WHERE email = ? LIMIT 1'
         );
         $stmt->execute([$email]);
         $user = $stmt->fetch();
@@ -61,10 +61,13 @@ switch ($action) {
             'role'  => $user['role'],
         ]);
 
-        audit('تسجيل دخول', $email);
+        // 🔐 تسجيل الجهاز/الجلسة لكل الأدوار (تعميم — لم يعد مقيّداً بـ 'مدير')
+        log_user_session($email, (string)($user['role'] ?? ''), $token);
+        audit('تسجيل دخول (' . ($user['role'] ?? '') . ')', $email);
 
-        // ✅ تسجيل جلسة لوحة المدير الويب (لتتبّع last_seen في admin_sessions)
-        if (($user['role'] ?? '') === 'مدير') {
+        // ✅ إبقاء تسجيل admin_sessions القديم للمدير/المالك فقط (توافقية خلفية
+        // مع لوحة الأدمن الويب التي لا تزال تقرأ من هذا الجدول تحديداً)
+        if (($user['role'] ?? '') === 'مدير' || ($user['role'] ?? '') === 'المالك') {
             try {
                 db()->prepare(
                     'INSERT INTO admin_sessions (user_email, token_hash, ip_address, user_agent, expires_at)
@@ -78,14 +81,17 @@ switch ($action) {
             } catch (Exception $e) { /* الجدول قد لا يكون موجوداً بعد — تجاهل بأمان */ }
         }
 
+        $permissions = effective_permissions((string)($user['role'] ?? ''), $user['permissions'] ?? null);
+
         json_ok([
             'success' => true,
             'token'   => $token,
             'user'    => [
-                'id'    => (int)$user['id'],
-                'name'  => $user['name'],
-                'email' => $user['email'],
-                'role'  => $user['role'],
+                'id'          => (int)$user['id'],
+                'name'        => $user['name'],
+                'email'       => $user['email'],
+                'role'        => $user['role'],
+                'permissions' => $permissions,
             ],
         ]);
         break;
@@ -106,6 +112,12 @@ switch ($action) {
         if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
             json_error('صيغة البريد الإلكتروني غير صحيحة');
         }
+
+        // ✅ إصلاح أمني: تحديد عدد محاولات إنشاء الحسابات لمنع إنشاء حسابات
+        // مزيّفة/spam بشكل آلي (نفس نمط login، لكن بحد أعلى لأن هذا إجراء
+        // مشروع يقوم به المستخدمون الجدد بشكل طبيعي)
+        $regIp = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+        rl_check('register', $regIp, 10, 3600);
 
         // ✅ التحقق من قوة كلمة المرور عند التسجيل
         $pwError = validate_password_strength($pass);
@@ -128,15 +140,58 @@ switch ($action) {
 
     case 'me':
         $payload = require_auth();
-        $stmt = db()->prepare('SELECT id, name, email, role FROM users WHERE id = ?');
+        $stmt = db()->prepare('SELECT id, name, email, role, branch_code FROM users WHERE id = ?');
         $stmt->execute([$payload['sub']]);
         $u = $stmt->fetch();
         if (!$u) json_error('المستخدم غير موجود', 404);
+        $u['permissions'] = $payload['permissions'] ?? [];
         json_ok(['success' => true, 'user' => $u]);
         break;
 
     case 'logout':
-        // المصادقة عبر JWT — العميل يمسح التوكن محلياً
+        // ✅ إنهاء الجلسة فعلياً في قاعدة البيانات (لا يكفي مسح التوكن محلياً
+        // فقط) — بذلك يمكن تعطيل الجلسة فوراً من لوحة التحكم أيضاً لاحقاً.
+        $token = bearer_token();
+        if ($token) {
+            try {
+                db()->prepare('UPDATE user_sessions SET revoked = 1 WHERE token_hash = ?')
+                    ->execute([hash('sha256', $token)]);
+            } catch (Exception $e) { /* تجاهل بأمان */ }
+        }
+        json_ok(['success' => true]);
+        break;
+
+    // ✅ تأكيد كلمة مرور المدير/المالك — يُستخدم في العمليات الحساسة (حذف
+    // فاتورة، خصم كبير...) دون الحاجة لتسجيل خروج المستخدم الحالي وتسجيل
+    // دخول المدير بدلاً منه. يتطلب Authorization الحالي (أي مستخدم) + بيانات
+    // مدير/مالك صريحة في الـ body.
+    case 'confirm_admin':
+        if ($method !== 'POST') json_error('استخدم POST', 405);
+        require_auth();
+        $body = input_json();
+        $adminEmail = strtolower(trim($body['admin_email'] ?? ''));
+        $adminPass  = (string)($body['admin_password'] ?? '');
+        if ($adminEmail === '' || $adminPass === '') {
+            json_error('بيانات المدير مطلوبة للتأكيد');
+        }
+        $ip = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+        rl_check('confirm_admin', $adminEmail . '|' . $ip, 5, 900);
+
+        $stmt = db()->prepare(
+            'SELECT id, role, password_hash, is_active FROM users WHERE email = ? LIMIT 1'
+        );
+        $stmt->execute([$adminEmail]);
+        $admin = $stmt->fetch();
+        if (!$admin || !$admin['is_active'] ||
+            !in_array($admin['role'], ['مدير', 'المالك'], true) ||
+            !password_verify($adminPass, $admin['password_hash'] ?? '')
+        ) {
+            usleep(300000);
+            audit('فشل تأكيد صلاحية مدير للعملية الحساسة', $adminEmail, 'warning');
+            json_error('بيانات المدير غير صحيحة', 401);
+        }
+        rl_clear('confirm_admin', $adminEmail . '|' . $ip);
+        audit('تأكيد صلاحية مدير لعملية حساسة', $adminEmail);
         json_ok(['success' => true]);
         break;
 

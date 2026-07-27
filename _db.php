@@ -197,17 +197,187 @@ function bearer_token(): ?string {
     return null;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 🛂 نظام الأدوار التسعة + الصلاحيات الدقيقة (RBAC)
+// ─────────────────────────────────────────────────────────────────────────────
+// كل الأدوار المدعومة في النظام (المفاتيح تُخزَّن بنفس النص العربي في عمود
+// users.role — لا حاجة لترحيل الحسابات القديمة: "مدير"/"كاشير"/"موظف" تبقى
+// كما هي وتُعامَل كأدوار صالحة ضمن هذه القائمة الموسّعة).
+define('APP_ROLES', [
+    'المالك', 'مدير', 'محاسب', 'أمين مخزن', 'كاشير',
+    'موظف مبيعات', 'مراقب', 'مدير فرع', 'خدمة عملاء',
+    'موظف', // دور قديم عام — يُعامَل كصلاحيات محدودة شبيهة بموظف المبيعات
+]);
+
+// جميع مفاتيح الصلاحيات الدقيقة القابلة للتفعيل/الإلغاء لكل مستخدم
+define('APP_PERMISSIONS', [
+    'sell', 'purchase', 'returns', 'discounts', 'editPrice', 'deleteInvoice',
+    'cancelInvoice', 'openDrawer', 'manageInventory', 'printBarcode',
+    'editProducts', 'reports', 'financialReports', 'profits', 'settings',
+    'manageUsers', 'backup', 'activityLog', 'manageBranches', 'manageTaxes',
+    'manageCurrencies', 'managePaymentMethods', 'manageOffers',
+    'approveSensitive', 'deleteSystem', 'manageLicense',
+]);
+
+// الصلاحيات الافتراضية لكل دور — تُطابق تماماً مصفوفة RolePermissions في
+// Flutter (lib/config/permissions.dart) — أي تعديل هنا يجب أن يُقابله تعديل هناك.
+function role_default_permissions(string $role): array {
+    $all = APP_PERMISSIONS;
+    $none = [];
+    switch ($role) {
+        case 'المالك':
+            return $all; // صلاحيات كاملة بدون قيود
+        case 'مدير':
+            return array_values(array_diff($all, ['deleteSystem', 'manageLicense']));
+        case 'محاسب':
+            return ['reports', 'financialReports', 'profits', 'activityLog', 'approveSensitive'];
+        case 'أمين مخزن':
+            return ['manageInventory', 'editProducts', 'printBarcode', 'purchase'];
+        case 'كاشير':
+            return ['sell', 'openDrawer', 'discounts'];
+        case 'موظف مبيعات':
+            return ['sell', 'discounts', 'reports'];
+        case 'مراقب':
+            return ['reports', 'financialReports', 'approveSensitive', 'discounts', 'returns'];
+        case 'مدير فرع':
+            return array_values(array_diff($all, [
+                'deleteSystem', 'manageLicense', 'manageBranches', 'backup',
+            ]));
+        case 'خدمة عملاء':
+            return ['returns', 'reports'];
+        case 'موظف':
+            return ['sell', 'reports'];
+        default:
+            return $none;
+    }
+}
+
+// دمج صلاحيات الدور الافتراضية مع تخصيصات المستخدم (JSONB) — أي مفتاح موجود
+// صريحاً في overrides (true/false) يتفوّق على الافتراضي؛ باقي المفاتيح تبقى
+// كما هي في افتراضي الدور.
+function effective_permissions(string $role, $permissionsJson): array {
+    $defaults = role_default_permissions($role);
+    $effective = array_fill_keys($defaults, true);
+    foreach (APP_PERMISSIONS as $key) {
+        if (!isset($effective[$key])) $effective[$key] = false;
+    }
+    $overrides = [];
+    if (is_string($permissionsJson) && $permissionsJson !== '') {
+        $decoded = json_decode($permissionsJson, true);
+        if (is_array($decoded)) $overrides = $decoded;
+    } elseif (is_array($permissionsJson)) {
+        $overrides = $permissionsJson;
+    }
+    foreach ($overrides as $key => $val) {
+        if (in_array($key, APP_PERMISSIONS, true)) {
+            $effective[$key] = (bool)$val;
+        }
+    }
+    return array_keys(array_filter($effective));
+}
+
+// ── مدة انتهاء الجلسة لعدم النشاط (بالدقائق) — قابلة للتهيئة عبر .env ─────────
+define('SESSION_IDLE_TIMEOUT_MIN', (int)(getenv('SESSION_IDLE_TIMEOUT_MIN') ?: 30));
+
+// ── تسجيل جلسة دخول جديدة لأي دور (تعميم admin_sessions القديم) ─────────────
+function log_user_session(string $email, string $role, string $token): void {
+    try {
+        $ip = $_SERVER['REMOTE_ADDR'] ?? '';
+        $ua = substr($_SERVER['HTTP_USER_AGENT'] ?? '', 0, 240);
+        db()->prepare(
+            'INSERT INTO user_sessions (user_email, role, token_hash, device_info, ip_address, user_agent, expires_at)
+             VALUES (?, ?, ?, ?, ?, ?, NOW() + INTERVAL \'7 days\')'
+        )->execute([$email, $role, hash('sha256', $token), $ua, $ip, $ua]);
+    } catch (Exception $e) { /* تجاهل بأمان — لا نمنع تسجيل الدخول لهذا الخطأ */ }
+}
+
+// ✅ إعادة بناء require_auth: يتحقق من JWT + الجلسة الفعلية (لدعم التعطيل
+// الفوري وانتهاء الجلسة عند الخمول) — يُعيد payload مُغنّى بالدور/الحالة/
+// الصلاحيات الفعلية المُحدَّثة من قاعدة البيانات مباشرة (وليس من التوكن القديم).
 function require_auth(): array {
     $payload = jwt_verify(bearer_token());
     if (!$payload) json_error('انتهت صلاحية الجلسة', 401);
+
+    $token = bearer_token();
+    $hash  = hash('sha256', (string)$token);
+
+    try {
+        $pdo = db();
+        // تحقق فوري من حالة المستخدم (تعطيل فوري) + جلب الدور والصلاحيات الحقيقية
+        $u = $pdo->prepare('SELECT role, is_active, permissions, branch_code FROM users WHERE email = ? LIMIT 1');
+        $u->execute([$payload['email'] ?? '']);
+        $user = $u->fetch();
+        if (!$user || !$user['is_active']) {
+            json_error('تم تعطيل هذا الحساب أو حذفه', 401);
+        }
+
+        // تحقق من الجلسة نفسها (خمول / إلغاء) — إن لم يُعثر على سجل جلسة (حسابات
+        // قديمة قبل التفعيل) نتجاوز بأمان دون رفض الطلب.
+        $s = $pdo->prepare(
+            'SELECT id, last_seen, revoked FROM user_sessions WHERE token_hash = ? LIMIT 1'
+        );
+        $s->execute([$hash]);
+        $session = $s->fetch();
+        if ($session) {
+            if ((int)$session['revoked'] === 1) {
+                json_error('تم إنهاء هذه الجلسة — سجّل الدخول مرة أخرى', 401);
+            }
+            $idleSeconds = SESSION_IDLE_TIMEOUT_MIN * 60;
+            $lastSeen = strtotime($session['last_seen'] . ' UTC');
+            if ($lastSeen !== false && (time() - $lastSeen) > $idleSeconds) {
+                $pdo->prepare('UPDATE user_sessions SET revoked = 1 WHERE id = ?')->execute([$session['id']]);
+                json_error('انتهت الجلسة لعدم النشاط — سجّل الدخول مرة أخرى', 401);
+            }
+            $pdo->prepare('UPDATE user_sessions SET last_seen = NOW() WHERE id = ?')->execute([$session['id']]);
+        }
+
+        // 🔄 الدور والصلاحيات دائماً من قاعدة البيانات الحيّة (لا من التوكن) —
+        // بذلك يسري أي تغيير في الدور/الصلاحيات فوراً بدون انتظار تسجيل دخول جديد.
+        $payload['role']        = $user['role'];
+        $payload['branch_code'] = $user['branch_code'];
+        $payload['permissions'] = effective_permissions($user['role'], $user['permissions']);
+    } catch (Exception $e) {
+        // فشل تحقق إضافي (اتصال DB مثلاً) — لا نرفض الطلب بقسوة، نعتمد على JWT فقط
+        error_log('[Jawali][require_auth] تحذير: ' . $e->getMessage());
+    }
+
     return $payload;
 }
 
-// ✅ مساعد جديد: التحقق من دور المدير
+// ✅ التحقق من دور المدير (يشمل المالك أيضاً — كلاهما "إدارة عليا")
 function require_admin(): array {
     $auth = require_auth();
-    if (($auth['role'] ?? '') !== 'مدير') {
+    $role = $auth['role'] ?? '';
+    if ($role !== 'مدير' && $role !== 'المالك') {
         json_error('غير مصرح — يتطلب صلاحية مدير', 403);
+    }
+    return $auth;
+}
+
+// ✅ التحقق من دور المالك فقط (للعمليات الحساسة جداً: حذف النظام، الترخيص)
+function require_owner(): array {
+    $auth = require_auth();
+    if (($auth['role'] ?? '') !== 'المالك') {
+        json_error('غير مصرح — يتطلب صلاحية المالك', 403);
+    }
+    return $auth;
+}
+
+// ✅ التحقق من دور محدد ضمن قائمة مسموحة
+function require_role(array $allowedRoles): array {
+    $auth = require_auth();
+    if (!in_array($auth['role'] ?? '', $allowedRoles, true)) {
+        json_error('غير مصرح — دورك الحالي لا يملك هذه الصلاحية', 403);
+    }
+    return $auth;
+}
+
+// ✅ التحقق من صلاحية دقيقة محدّدة (permission-based) بدلاً من الدور فقط
+function require_permission(string $permission): array {
+    $auth = require_auth();
+    $perms = $auth['permissions'] ?? [];
+    if (!in_array($permission, $perms, true)) {
+        json_error('غير مصرح — تحتاج صلاحية "' . $permission . '"', 403);
     }
     return $auth;
 }
