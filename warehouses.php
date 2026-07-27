@@ -20,12 +20,13 @@ $pdo    = db();
 
 switch ($method) {
     case 'GET': {
-        require_auth();
+        $auth = require_auth();
+        $tenantId = tenant_id_from_auth($auth);
 
         if (isset($_GET['stock'])) {
             $warehouseId = $_GET['warehouse_id'] ?? '';
-            $sql  = 'SELECT * FROM warehouse_stock WHERE 1=1';
-            $args = [];
+            $sql  = 'SELECT * FROM warehouse_stock WHERE tenant_id = ?';
+            $args = [$tenantId];
             if ($warehouseId !== '') {
                 $sql .= ' AND warehouse_id = ?';
                 $args[] = $warehouseId;
@@ -37,21 +38,24 @@ switch ($method) {
         }
 
         if (isset($_GET['transfers'])) {
-            $stmt = $pdo->query(
-                'SELECT * FROM warehouse_transfers ORDER BY date DESC LIMIT 500'
+            $stmt = $pdo->prepare(
+                'SELECT * FROM warehouse_transfers WHERE tenant_id = ? ORDER BY date DESC LIMIT 500'
             );
+            $stmt->execute([$tenantId]);
             json_ok($stmt->fetchAll());
         }
 
-        $stmt = $pdo->query(
-            'SELECT * FROM warehouses WHERE is_active = TRUE ORDER BY is_default DESC, created_at ASC'
+        $stmt = $pdo->prepare(
+            'SELECT * FROM warehouses WHERE is_active = TRUE AND tenant_id = ? ORDER BY is_default DESC, created_at ASC'
         );
+        $stmt->execute([$tenantId]);
         json_ok($stmt->fetchAll());
         break;
     }
 
     case 'POST': {
-        require_auth();
+        $auth = require_auth();
+        $tenantId = tenant_id_from_auth($auth);
         $action = $_GET['action'] ?? '';
         $body   = input_json();
 
@@ -72,9 +76,9 @@ switch ($method) {
                 $pdo->beginTransaction();
 
                 $fromStock = $pdo->prepare(
-                    'SELECT * FROM warehouse_stock WHERE warehouse_id = ? AND product_sku = ? LIMIT 1'
+                    'SELECT * FROM warehouse_stock WHERE warehouse_id = ? AND product_sku = ? AND tenant_id = ? LIMIT 1'
                 );
-                $fromStock->execute([$fromId, $sku]);
+                $fromStock->execute([$fromId, $sku, $tenantId]);
                 $from = $fromStock->fetch();
                 $availableQty = $from ? (int)$from['stock'] : 0;
                 if ($availableQty < $qty) {
@@ -83,24 +87,25 @@ switch ($method) {
                 }
 
                 $pdo->prepare(
-                    'UPDATE warehouse_stock SET stock = stock - ? WHERE warehouse_id = ? AND product_sku = ?'
-                )->execute([$qty, $fromId, $sku]);
+                    'UPDATE warehouse_stock SET stock = stock - ? WHERE warehouse_id = ? AND product_sku = ? AND tenant_id = ?'
+                )->execute([$qty, $fromId, $sku, $tenantId]);
 
                 $pdo->prepare(
-                    'INSERT INTO warehouse_stock (id, warehouse_id, product_sku, stock)
-                     VALUES (?, ?, ?, ?)
+                    'INSERT INTO warehouse_stock (id, warehouse_id, product_sku, stock, tenant_id)
+                     VALUES (?, ?, ?, ?, ?)
                      ON CONFLICT (warehouse_id, product_sku)
-                     DO UPDATE SET stock = warehouse_stock.stock + EXCLUDED.stock'
-                )->execute(['WS-' . round(microtime(true) * 1000), $toId, $sku, $qty]);
+                     DO UPDATE SET stock = warehouse_stock.stock + EXCLUDED.stock
+                     WHERE warehouse_stock.tenant_id = EXCLUDED.tenant_id'
+                )->execute(['WS-' . round(microtime(true) * 1000), $toId, $sku, $qty, $tenantId]);
 
                 $txId = 'WT-' . round(microtime(true) * 1000);
                 $pdo->prepare(
                     'INSERT INTO warehouse_transfers
-                       (id, from_warehouse_id, to_warehouse_id, product_sku, qty, notes, created_by)
-                     VALUES (?, ?, ?, ?, ?, ?, ?)'
+                       (id, from_warehouse_id, to_warehouse_id, product_sku, qty, notes, created_by, tenant_id)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
                 )->execute([
                     $txId, $fromId, $toId, $sku, $qty, $notes,
-                    $_SERVER['HTTP_X_USER_EMAIL'] ?? null,
+                    $_SERVER['HTTP_X_USER_EMAIL'] ?? null, $tenantId,
                 ]);
 
                 $pdo->commit();
@@ -110,7 +115,7 @@ switch ($method) {
                 json_error('خطأ داخلي في الخادم', 500);
             }
 
-            audit("warehouse transfer $sku qty=$qty from=$fromId to=$toId");
+            audit("warehouse transfer $sku qty=$qty from=$fromId to=$toId", null, 'info', $tenantId);
             json_ok(['success' => true, 'id' => $txId]);
             break;
         }
@@ -128,27 +133,31 @@ switch ($method) {
 
         if ($isNew) {
             $stmt = $pdo->prepare(
-                'INSERT INTO warehouses (id, name, location, is_default, notes) VALUES (?, ?, ?, ?, ?)'
+                'INSERT INTO warehouses (id, name, location, is_default, notes, tenant_id) VALUES (?, ?, ?, ?, ?, ?)'
             );
-            $stmt->execute([$id, $name, $location, $isDefault, $notes]);
-            audit("create warehouse $id ($name)");
+            $stmt->execute([$id, $name, $location, $isDefault, $notes, $tenantId]);
+            audit("create warehouse $id ($name)", null, 'info', $tenantId);
         } else {
             $stmt = $pdo->prepare(
-                'UPDATE warehouses SET name = ?, location = ?, notes = ? WHERE id = ?'
+                'UPDATE warehouses SET name = ?, location = ?, notes = ? WHERE id = ? AND tenant_id = ?'
             );
-            $stmt->execute([$name, $location, $notes, $id]);
-            audit("update warehouse $id ($name)");
+            $stmt->execute([$name, $location, $notes, $id, $tenantId]);
+            if ($stmt->rowCount() === 0) json_error('المخزن غير موجود في متجرك', 404);
+            audit("update warehouse $id ($name)", null, 'info', $tenantId);
         }
         json_ok(['success' => true, 'id' => $id]);
         break;
     }
 
     case 'DELETE': {
-        require_admin();
+        $auth = require_admin();
+        $tenantId = tenant_id_from_auth($auth);
         $id = $_GET['id'] ?? '';
         if ($id === '') json_error('id مطلوب');
-        $pdo->prepare('UPDATE warehouses SET is_active = FALSE WHERE id = ?')->execute([$id]);
-        audit("deactivate warehouse $id", null, 'warning');
+        $upd = $pdo->prepare('UPDATE warehouses SET is_active = FALSE WHERE id = ? AND tenant_id = ?');
+        $upd->execute([$id, $tenantId]);
+        if ($upd->rowCount() === 0) json_error('المخزن غير موجود في متجرك', 404);
+        audit("deactivate warehouse $id", null, 'warning', $tenantId);
         json_ok(['success' => true]);
         break;
     }

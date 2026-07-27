@@ -27,18 +27,20 @@ switch ($method) {
     // GET
     // ─────────────────────────────────────────────────────────────────────────
     case 'GET': {
-        require_auth();
+        $auth = require_auth();
+        $tenantId = tenant_id_from_auth($auth);
 
         // دليل الحسابات
         if (isset($_GET['coa'])) {
             if (!empty($_GET['id'])) {
-                $stmt = $pdo->prepare('SELECT * FROM chart_of_accounts WHERE id = ? LIMIT 1');
-                $stmt->execute([$_GET['id']]);
+                $stmt = $pdo->prepare('SELECT * FROM chart_of_accounts WHERE id = ? AND tenant_id = ? LIMIT 1');
+                $stmt->execute([$_GET['id'], $tenantId]);
                 json_ok($stmt->fetch() ?: []);
             }
-            $stmt = $pdo->query(
-                'SELECT * FROM chart_of_accounts WHERE is_active = TRUE ORDER BY code ASC'
+            $stmt = $pdo->prepare(
+                'SELECT * FROM chart_of_accounts WHERE is_active = TRUE AND tenant_id = ? ORDER BY code ASC'
             );
+            $stmt->execute([$tenantId]);
             json_ok($stmt->fetchAll());
         }
 
@@ -47,8 +49,8 @@ switch ($method) {
             $accountId = $_GET['account_id'] ?? '';
             if ($accountId === '') json_error('account_id مطلوب');
 
-            $accStmt = $pdo->prepare('SELECT * FROM chart_of_accounts WHERE id = ? LIMIT 1');
-            $accStmt->execute([$accountId]);
+            $accStmt = $pdo->prepare('SELECT * FROM chart_of_accounts WHERE id = ? AND tenant_id = ? LIMIT 1');
+            $accStmt->execute([$accountId, $tenantId]);
             $acc = $accStmt->fetch();
             if (!$acc) json_error('الحساب غير موجود', 404);
 
@@ -57,10 +59,10 @@ switch ($method) {
                         je.id AS entry_id, je.entry_number, je.date, je.description, je.reference
                  FROM journal_entry_lines jel
                  JOIN journal_entries je ON je.id = jel.entry_id
-                 WHERE jel.account_id = ? AND je.status != \'void\'
+                 WHERE jel.account_id = ? AND jel.tenant_id = ? AND je.status != \'void\'
                  ORDER BY je.date ASC, jel.id ASC'
             );
-            $stmt->execute([$accountId]);
+            $stmt->execute([$accountId, $tenantId]);
             $lines = $stmt->fetchAll();
 
             $balance = (float)$acc['opening_balance'];
@@ -84,23 +86,24 @@ switch ($method) {
 
         // قيد محدد مع سطوره
         if (!empty($_GET['id'])) {
-            $stmt = $pdo->prepare('SELECT * FROM journal_entries WHERE id = ? LIMIT 1');
-            $stmt->execute([$_GET['id']]);
+            $stmt = $pdo->prepare('SELECT * FROM journal_entries WHERE id = ? AND tenant_id = ? LIMIT 1');
+            $stmt->execute([$_GET['id'], $tenantId]);
             $entry = $stmt->fetch();
             if (!$entry) json_error('القيد غير موجود', 404);
             $lStmt = $pdo->prepare(
                 'SELECT jel.*, coa.name AS account_name, coa.code AS account_code
                  FROM journal_entry_lines jel
-                 JOIN chart_of_accounts coa ON coa.id = jel.account_id
-                 WHERE jel.entry_id = ? ORDER BY jel.id ASC'
+                 JOIN chart_of_accounts coa ON coa.id = jel.account_id AND coa.tenant_id = jel.tenant_id
+                 WHERE jel.entry_id = ? AND jel.tenant_id = ? ORDER BY jel.id ASC'
             );
-            $lStmt->execute([$_GET['id']]);
+            $lStmt->execute([$_GET['id'], $tenantId]);
             $entry['lines'] = $lStmt->fetchAll();
             json_ok($entry);
         }
 
         // قائمة رؤوس القيود
-        $stmt = $pdo->query('SELECT * FROM journal_entries ORDER BY date DESC LIMIT 500');
+        $stmt = $pdo->prepare('SELECT * FROM journal_entries WHERE tenant_id = ? ORDER BY date DESC LIMIT 500');
+        $stmt->execute([$tenantId]);
         json_ok($stmt->fetchAll());
         break;
     }
@@ -109,7 +112,8 @@ switch ($method) {
     // POST
     // ─────────────────────────────────────────────────────────────────────────
     case 'POST': {
-        require_auth();
+        $auth = require_auth();
+        $tenantId = tenant_id_from_auth($auth);
         $body = input_json();
 
         // ── إنشاء/تحديث حساب في الدليل ──────────────────────────────────────
@@ -119,7 +123,9 @@ switch ($method) {
             $name = trim($body['name'] ?? '');
             if ($code === '' || $name === '') json_error('code و name مطلوبان');
             $isNew = $id === '';
-            if ($isNew) $id = 'COA-' . $code;
+            // ✅ Multi-Tenant: id يدمج tenant_id لمنع تعارض المفتاح الأساسي العام
+            // بين متاجر مختلفين لو استعملوا نفس رمز الحساب (code)
+            if ($isNew) $id = 'COA-' . $tenantId . '-' . $code;
 
             $type = $body['type'] ?? 'asset';
             $parentId = trim($body['parent_id'] ?? $body['parentId'] ?? '');
@@ -128,19 +134,20 @@ switch ($method) {
 
             if ($isNew) {
                 $stmt = $pdo->prepare(
-                    'INSERT INTO chart_of_accounts (id, code, name, type, parent_id, opening_balance, notes)
-                     VALUES (?, ?, ?, ?, NULLIF(?, \'\'), ?, ?)'
+                    'INSERT INTO chart_of_accounts (id, code, name, type, parent_id, opening_balance, notes, tenant_id)
+                     VALUES (?, ?, ?, ?, NULLIF(?, \'\'), ?, ?, ?)'
                 );
-                $stmt->execute([$id, $code, $name, $type, $parentId, $opening, $notes]);
-                audit("create COA account $id ($name)");
+                $stmt->execute([$id, $code, $name, $type, $parentId, $opening, $notes, $tenantId]);
+                audit("create COA account $id ($name)", null, 'info', $tenantId);
             } else {
                 $stmt = $pdo->prepare(
                     'UPDATE chart_of_accounts SET
                         code = ?, name = ?, type = ?, parent_id = NULLIF(?, \'\'), notes = ?
-                     WHERE id = ?'
+                     WHERE id = ? AND tenant_id = ?'
                 );
-                $stmt->execute([$code, $name, $type, $parentId, $notes, $id]);
-                audit("update COA account $id ($name)");
+                $stmt->execute([$code, $name, $type, $parentId, $notes, $id, $tenantId]);
+                if ($stmt->rowCount() === 0) json_error('الحساب غير موجود في متجرك', 404);
+                audit("update COA account $id ($name)", null, 'info', $tenantId);
             }
             json_ok(['success' => true, 'id' => $id]);
             break;
@@ -177,12 +184,12 @@ switch ($method) {
             $pdo->beginTransaction();
 
             $ins = $pdo->prepare(
-                'INSERT INTO journal_entries (id, entry_number, date, description, reference, status, created_by)
-                 VALUES (?, ?, COALESCE(NULLIF(?, \'\')::timestamp, NOW()), ?, ?, \'posted\', ?)'
+                'INSERT INTO journal_entries (id, entry_number, date, description, reference, status, created_by, tenant_id)
+                 VALUES (?, ?, COALESCE(NULLIF(?, \'\')::timestamp, NOW()), ?, ?, \'posted\', ?, ?)'
             );
             $ins->execute([
                 $id, $entryNumber, $date, $description, $reference,
-                $_SERVER['HTTP_X_USER_EMAIL'] ?? '',
+                $_SERVER['HTTP_X_USER_EMAIL'] ?? '', $tenantId,
             ]);
 
             foreach ($lines as $i => $l) {
@@ -191,14 +198,21 @@ switch ($method) {
                     $pdo->rollBack();
                     json_error('account_id مطلوب لكل سطر');
                 }
+                // ✅ Multi-Tenant: التأكد أن الحساب ينتمي للمتجر الحالي
+                $accChk = $pdo->prepare('SELECT 1 FROM chart_of_accounts WHERE id = ? AND tenant_id = ?');
+                $accChk->execute([$accountId, $tenantId]);
+                if (!$accChk->fetch()) {
+                    $pdo->rollBack();
+                    json_error('الحساب ' . $accountId . ' لا ينتمي لمتجرك', 404);
+                }
                 $lineId = $id . '-L' . ($i + 1);
                 $pdo->prepare(
-                    'INSERT INTO journal_entry_lines (id, entry_id, account_id, debit, credit, notes)
-                     VALUES (?, ?, ?, ?, ?, ?)'
+                    'INSERT INTO journal_entry_lines (id, entry_id, account_id, debit, credit, notes, tenant_id)
+                     VALUES (?, ?, ?, ?, ?, ?, ?)'
                 )->execute([
                     $lineId, $id, $accountId,
                     (float)($l['debit'] ?? 0), (float)($l['credit'] ?? 0),
-                    $l['notes'] ?? '',
+                    $l['notes'] ?? '', $tenantId,
                 ]);
             }
 
@@ -209,7 +223,7 @@ switch ($method) {
             json_error('خطأ داخلي في الخادم', 500);
         }
 
-        audit("create journal entry $id total=$totalDebit");
+        audit("create journal entry $id total=$totalDebit", null, 'info', $tenantId);
         json_ok(['success' => true, 'id' => $id, 'entry_number' => $entryNumber]);
         break;
     }
@@ -218,21 +232,26 @@ switch ($method) {
     // DELETE
     // ─────────────────────────────────────────────────────────────────────────
     case 'DELETE': {
-        require_admin();
+        $auth = require_admin();
+        $tenantId = tenant_id_from_auth($auth);
 
         if (isset($_GET['coa'])) {
             $id = $_GET['id'] ?? '';
             if ($id === '') json_error('id مطلوب');
-            $pdo->prepare('UPDATE chart_of_accounts SET is_active = FALSE WHERE id = ?')->execute([$id]);
-            audit("deactivate COA account $id", null, 'warning');
+            $upd = $pdo->prepare('UPDATE chart_of_accounts SET is_active = FALSE WHERE id = ? AND tenant_id = ?');
+            $upd->execute([$id, $tenantId]);
+            if ($upd->rowCount() === 0) json_error('الحساب غير موجود في متجرك', 404);
+            audit("deactivate COA account $id", null, 'warning', $tenantId);
             json_ok(['success' => true]);
             break;
         }
 
         $id = $_GET['id'] ?? '';
         if ($id === '') json_error('id مطلوب');
-        $pdo->prepare("UPDATE journal_entries SET status = 'void' WHERE id = ?")->execute([$id]);
-        audit("void journal entry $id", null, 'warning');
+        $upd = $pdo->prepare("UPDATE journal_entries SET status = 'void' WHERE id = ? AND tenant_id = ?");
+        $upd->execute([$id, $tenantId]);
+        if ($upd->rowCount() === 0) json_error('القيد غير موجود في متجرك', 404);
+        audit("void journal entry $id", null, 'warning', $tenantId);
         json_ok(['success' => true]);
         break;
     }

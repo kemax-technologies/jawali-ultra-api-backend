@@ -6,8 +6,11 @@ $pdo    = db();
 
 switch ($method) {
     case 'GET': {
-        require_auth();  // ✅ إصلاح: حماية GET بالمصادقة
-        $rows = $pdo->query('SELECT * FROM purchases ORDER BY date DESC LIMIT 200')->fetchAll();
+        $auth = require_auth();  // ✅ إصلاح: حماية GET بالمصادقة
+        $tenantId = tenant_id_from_auth($auth);
+        $stmt = $pdo->prepare('SELECT * FROM purchases WHERE tenant_id = ? ORDER BY date DESC LIMIT 200');
+        $stmt->execute([$tenantId]);
+        $rows = $stmt->fetchAll();
         foreach ($rows as &$r) {
             if (!empty($r['items_json'])) $r['items'] = json_decode($r['items_json'], true) ?: [];
         }
@@ -15,7 +18,8 @@ switch ($method) {
         break;
     }
     case 'POST': {
-        require_auth();
+        $auth = require_auth();
+        $tenantId = tenant_id_from_auth($auth);
         $b   = input_json();
         $id  = trim($b['id'] ?? '');
         if ($id === '') $id = 'PO-' . time();
@@ -29,11 +33,12 @@ switch ($method) {
         $pdo->beginTransaction();
         try {
             $stmt = $pdo->prepare(
-                'INSERT INTO purchases (id, supplier_name, subtotal, discount, tax, total, status, items_json, date, payment_method, cash_account_id)
-                 VALUES (?,?,?,?,?,?,?,?,?,?,NULLIF(?, \'\'))'
+                'INSERT INTO purchases (id, tenant_id, supplier_name, subtotal, discount, tax, total, status, items_json, date, payment_method, cash_account_id)
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,NULLIF(?, \'\'))'
             );
             $stmt->execute([
                 $id,
+                $tenantId,
                 $b['supplier']      ?? $b['supplier_name'] ?? 'مورد',
                 (float)($b['subtotal'] ?? 0),
                 $discount,
@@ -48,11 +53,11 @@ switch ($method) {
 
             // زيادة المخزون عند الاستلام
             if (($b['status'] ?? 'مستلمة') === 'مستلمة' && is_array($items)) {
-                $up = $pdo->prepare('UPDATE products SET stock = stock + ? WHERE sku = ?');
+                $up = $pdo->prepare('UPDATE products SET stock = stock + ? WHERE sku = ? AND tenant_id = ?');
                 foreach ($items as $it) {
                     $sku = $it['sku'] ?? '';
                     $qty = (int)($it['qty'] ?? 0);
-                    if ($sku !== '' && $qty > 0) $up->execute([$qty, $sku]);
+                    if ($sku !== '' && $qty > 0) $up->execute([$qty, $sku, $tenantId]);
                 }
             }
 
@@ -60,18 +65,18 @@ switch ($method) {
             // من رصيد الصندوق تلقائياً + سجّل حركة صندوق (المشتريات الآجلة لا
             // تُخصم هنا لأنها تُدار عبر رصيد المورد بشكل منفصل)
             if ($cashAccountId !== '' && $paymentMethod !== 'آجل' && $total > 0) {
-                $accStmt = $pdo->prepare('SELECT * FROM cash_accounts WHERE id = ? LIMIT 1');
-                $accStmt->execute([$cashAccountId]);
+                $accStmt = $pdo->prepare('SELECT * FROM cash_accounts WHERE id = ? AND tenant_id = ? LIMIT 1');
+                $accStmt->execute([$cashAccountId, $tenantId]);
                 $acc = $accStmt->fetch();
                 if ($acc) {
-                    $pdo->prepare('UPDATE cash_accounts SET balance = balance - ? WHERE id = ?')
-                        ->execute([$total, $cashAccountId]);
+                    $pdo->prepare('UPDATE cash_accounts SET balance = balance - ? WHERE id = ? AND tenant_id = ?')
+                        ->execute([$total, $cashAccountId, $tenantId]);
                     $txId = 'TX-' . round(microtime(true) * 1000);
                     $pdo->prepare(
-                        'INSERT INTO cash_transactions (id, account_id, type, amount, currency, notes, created_by)
-                         VALUES (?, ?, ?, ?, ?, ?, ?)'
+                        'INSERT INTO cash_transactions (id, tenant_id, account_id, type, amount, currency, notes, created_by)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
                     )->execute([
-                        $txId, $cashAccountId, 'مشتريات', -$total, $acc['currency'],
+                        $txId, $tenantId, $cashAccountId, 'مشتريات', -$total, $acc['currency'],
                         "فاتورة شراء $id", $_SERVER['HTTP_X_USER_EMAIL'] ?? null,
                     ]);
                 }
@@ -83,7 +88,7 @@ switch ($method) {
             error_log('[Jawali][purchases] فشل حفظ فاتورة الشراء: ' . $e->getMessage());
             json_error('خطأ داخلي في الخادم', 500);
         }
-        audit("purchase $id");
+        audit("purchase $id", null, 'info', $tenantId);
         json_ok(['success' => true, 'id' => $id]);
         break;
     }

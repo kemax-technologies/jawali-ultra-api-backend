@@ -203,8 +203,13 @@ function bearer_token(): ?string {
 // كل الأدوار المدعومة في النظام (المفاتيح تُخزَّن بنفس النص العربي في عمود
 // users.role — لا حاجة لترحيل الحسابات القديمة: "مدير"/"كاشير"/"موظف" تبقى
 // كما هي وتُعامَل كأدوار صالحة ضمن هذه القائمة الموسّعة).
+// ✅ تحديث بنية SaaS متعدد المتاجر: أُزيل دور "المالك" من هذا النظام —
+// "مالك التطبيق" (صاحب منصة Jawali Ultra كاملة) أصبح يُدار حصراً عبر لوحة
+// المطوّر المستقلة (dev_panel + _dev_db.php)، وليس عبر جدول users/الأدوار
+// العادية. كل حساب "مدير" هنا هو الآن صاحب متجر (Tenant) مستقل يدير متجره
+// فقط، ولا صلة له بإدارة المنصة أو المتاجر الأخرى.
 define('APP_ROLES', [
-    'المالك', 'مدير', 'محاسب', 'أمين مخزن', 'كاشير',
+    'مدير', 'محاسب', 'أمين مخزن', 'كاشير',
     'موظف مبيعات', 'مراقب', 'مدير فرع', 'خدمة عملاء',
     'موظف', // دور قديم عام — يُعامَل كصلاحيات محدودة شبيهة بموظف المبيعات
 ]);
@@ -225,9 +230,10 @@ function role_default_permissions(string $role): array {
     $all = APP_PERMISSIONS;
     $none = [];
     switch ($role) {
-        case 'المالك':
-            return $all; // صلاحيات كاملة بدون قيود
         case 'مدير':
+            // "مدير" = صاحب المتجر (Tenant Owner) — كل صلاحيات إدارة متجره،
+            // باستثناء صلاحيات مستوى المنصة (deleteSystem/manageLicense) التي
+            // تبقى حصراً لمالك التطبيق عبر لوحة المطوّر.
             return array_values(array_diff($all, ['deleteSystem', 'manageLicense']));
         case 'محاسب':
             return ['reports', 'financialReports', 'profits', 'activityLog', 'approveSensitive'];
@@ -301,14 +307,34 @@ function require_auth(): array {
     $token = bearer_token();
     $hash  = hash('sha256', (string)$token);
 
+    // ✅ Multi-Tenant: تحديد tenant_id إلزامي دائماً من قاعدة البيانات الحيّة —
+    // لا يُسمح مطلقاً بأي مسار احتياطي (fallback) يُكمِّل الطلب بدون tenant_id
+    // محقَّق، لأن ذلك قد يُسرِّب بيانات متجر لآخر. أي فشل في جلبه = رفض الطلب.
     try {
         $pdo = db();
-        // تحقق فوري من حالة المستخدم (تعطيل فوري) + جلب الدور والصلاحيات الحقيقية
-        $u = $pdo->prepare('SELECT role, is_active, permissions, branch_code FROM users WHERE email = ? LIMIT 1');
+        // تحقق فوري من حالة المستخدم (تعطيل فوري) + جلب الدور/الصلاحيات/tenant_id
+        $u = $pdo->prepare('SELECT role, is_active, permissions, branch_code, tenant_id FROM users WHERE email = ? LIMIT 1');
         $u->execute([$payload['email'] ?? '']);
         $user = $u->fetch();
         if (!$user || !$user['is_active']) {
             json_error('تم تعطيل هذا الحساب أو حذفه', 401);
+        }
+        if (!isset($user['tenant_id']) || $user['tenant_id'] === null) {
+            // ✅ حالة غير طبيعية إطلاقاً بعد الترحيل (migration) — رفض صارم
+            // بدلاً من افتراض أي متجر افتراضي (يمنع أي تسريب بيانات محتمل).
+            error_log('[Jawali][require_auth] خطأ حرج: مستخدم بلا tenant_id — email=' . ($payload['email'] ?? ''));
+            json_error('خطأ في تهيئة الحساب — تواصل مع الدعم', 500);
+        }
+
+        // ✅ Multi-Tenant: تحقق من حالة المتجر (Tenant) نفسه — لوحة المطوّر
+        // قادرة على تعليق/حظر متجر كامل (tenants.is_active = 0) عند الحاجة
+        // (مثل مخالفة الشروط أو تجاوز الحد المجاني)، فيُحظر كل مستخدمي ذلك
+        // المتجر فوراً بغض النظر عن حالة حسابهم الفردي (is_active).
+        $t = $pdo->prepare('SELECT is_active FROM tenants WHERE id = ? LIMIT 1');
+        $t->execute([(int)$user['tenant_id']]);
+        $tenantActive = $t->fetchColumn();
+        if ($tenantActive === false || !(int)$tenantActive) {
+            json_error('تم تعليق هذا المتجر — يرجى التواصل مع الدعم', 403);
         }
 
         // تحقق من الجلسة نفسها (خمول / إلغاء) — إن لم يُعثر على سجل جلسة (حسابات
@@ -331,37 +357,35 @@ function require_auth(): array {
             $pdo->prepare('UPDATE user_sessions SET last_seen = NOW() WHERE id = ?')->execute([$session['id']]);
         }
 
-        // 🔄 الدور والصلاحيات دائماً من قاعدة البيانات الحيّة (لا من التوكن) —
-        // بذلك يسري أي تغيير في الدور/الصلاحيات فوراً بدون انتظار تسجيل دخول جديد.
+        // 🔄 الدور/الصلاحيات/tenant_id دائماً من قاعدة البيانات الحيّة (لا من
+        // التوكن) — بذلك يسري أي تغيير فوراً بدون انتظار تسجيل دخول جديد.
         $payload['role']        = $user['role'];
         $payload['branch_code'] = $user['branch_code'];
+        $payload['tenant_id']   = (int)$user['tenant_id'];
         $payload['permissions'] = effective_permissions($user['role'], $user['permissions']);
     } catch (Exception $e) {
-        // فشل تحقق إضافي (اتصال DB مثلاً) — لا نرفض الطلب بقسوة، نعتمد على JWT فقط
-        error_log('[Jawali][require_auth] تحذير: ' . $e->getMessage());
+        // ✅ Multi-Tenant: فشل الاتصال بقاعدة البيانات هنا يعني عدم إمكانية
+        // تحديد tenant_id بثقة — لا يجوز إكمال الطلب على التوكن القديم فقط
+        // (قد يحمل بيانات دور/صلاحيات قديمة غير محدَّثة). نرفض الطلب بأمان.
+        error_log('[Jawali][require_auth] خطأ: ' . $e->getMessage());
+        json_error('خطأ داخلي في الخادم', 500);
     }
 
     return $payload;
 }
 
-// ✅ التحقق من دور المدير (يشمل المالك أيضاً — كلاهما "إدارة عليا")
+// ✅ التحقق من دور المدير (صاحب المتجر — أعلى دور ضمن المتجر الواحد)
 function require_admin(): array {
     $auth = require_auth();
     $role = $auth['role'] ?? '';
-    if ($role !== 'مدير' && $role !== 'المالك') {
+    if ($role !== 'مدير') {
         json_error('غير مصرح — يتطلب صلاحية مدير', 403);
     }
     return $auth;
 }
-
-// ✅ التحقق من دور المالك فقط (للعمليات الحساسة جداً: حذف النظام، الترخيص)
-function require_owner(): array {
-    $auth = require_auth();
-    if (($auth['role'] ?? '') !== 'المالك') {
-        json_error('غير مصرح — يتطلب صلاحية المالك', 403);
-    }
-    return $auth;
-}
+// ملاحظة: لا يوجد "require_owner" على مستوى تطبيق المتجر بعد الآن — العمليات
+// الحساسة جداً (حذف النظام، الترخيص، إدارة كل المتاجر) تُنفَّذ فقط من لوحة
+// المطوّر المستقلة (dev_*.php + dev_require_auth) وليس من هذا الملف.
 
 // ✅ التحقق من دور محدد ضمن قائمة مسموحة
 function require_role(array $allowedRoles): array {
@@ -383,16 +407,36 @@ function require_permission(string $permission): array {
 }
 
 // ── سجل تدقيق ────────────────────────────────────────────────────────────────
-function audit(string $action, ?string $email = null, string $level = 'info'): void {
+// ✅ Multi-Tenant: $tenantId اختياري — يُمرَّر من الملف المستدعي عند توفره
+// (عادة من require_auth()['tenant_id']) لربط كل حدث بمتجره بدقة.
+function audit(string $action, ?string $email = null, string $level = 'info', ?int $tenantId = null): void {
     try {
         $stmt = db()->prepare(
-            'INSERT INTO audit_log (action, user_email, ip_address, user_agent) VALUES (?, ?, ?, ?)'
+            'INSERT INTO audit_log (action, user_email, ip_address, user_agent, tenant_id) VALUES (?, ?, ?, ?, ?)'
         );
         $stmt->execute([
             "[$level] $action",
             $email ?? ($_SERVER['HTTP_X_USER_EMAIL'] ?? null),
             $_SERVER['REMOTE_ADDR'] ?? '',
             substr($_SERVER['HTTP_USER_AGENT'] ?? '', 0, 240),
+            $tenantId,
         ]);
     } catch (Exception $e) { /* تجاهل أخطاء السجل */ }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ✅ Multi-Tenant Helper: يُستخدم في كل ملف API لضمان تصفية كل استعلام
+// بـ tenant_id الخاص بالمستخدم المسجّل دخوله حالياً — يمنع تسريب بيانات بين
+// المتاجر. يُستدعى بعد require_auth()/require_admin()/... مباشرة.
+// الاستخدام: $tenantId = tenant_id_from_auth($auth);
+// ثم: 'SELECT * FROM products WHERE tenant_id = ? AND sku = ?' [$tenantId, $sku]
+// ─────────────────────────────────────────────────────────────────────────────
+function tenant_id_from_auth(array $auth): int {
+    $tid = $auth['tenant_id'] ?? null;
+    if ($tid === null) {
+        // لا يجب أن يحدث هذا أبداً بعد require_auth() — أمان إضافي فقط
+        error_log('[Jawali][tenant_id_from_auth] خطأ حرج: tenant_id غير موجود في auth payload');
+        json_error('خطأ في تهيئة الحساب — تواصل مع الدعم', 500);
+    }
+    return (int)$tid;
 }

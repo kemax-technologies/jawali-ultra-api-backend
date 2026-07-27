@@ -18,29 +18,39 @@ $b = input_json();
 $action = $b['action'] ?? '';
 
 // ── إنشاء مستخدم جديد (لا يحتاج user_id) ────────────────────────────────────
+// Multi-Tenant: لوحة المطوّر لا تُنشئ متاجر جديدة تلقائياً (ذلك محجوز للتسجيل
+// العام الذاتي عبر auth.php/social_auth.php) — بل يجب على المطوّر تحديد
+// المتجر (tenant_id) القائم الذي سينضم إليه المستخدم الجديد صريحاً، لمنع
+// إنشاء مستخدمين بلا tenant_id (وهو خطأ فادح يوقف عملهم عند أول تسجيل دخول).
 if ($action === 'create') {
     $name  = trim((string)($b['name'] ?? ''));
     $email = strtolower(trim((string)($b['email'] ?? '')));
     $pass  = (string)($b['password'] ?? '');
     $role  = in_array($b['role'] ?? '', ['مدير', 'كاشير', 'موظف'], true) ? $b['role'] : 'كاشير';
     $branch = strtoupper(trim((string)($b['branch_code'] ?? 'MAIN')));
+    $tenantId = (int)($b['tenant_id'] ?? 0);
 
     if ($name === '' || $email === '' || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
         json_error('الاسم والبريد الإلكتروني الصحيح مطلوبان');
     }
     if (strlen($pass) < 6) json_error('كلمة المرور يجب أن تكون 6 أحرف على الأقل');
+    if ($tenantId <= 0) json_error('tenant_id مطلوب — يجب تحديد المتجر القائم الذي سينضم إليه المستخدم', 400);
+
+    $tExists = $pdo->prepare('SELECT 1 FROM tenants WHERE id = ?');
+    $tExists->execute([$tenantId]);
+    if (!$tExists->fetch()) json_error('المتجر (tenant_id) المحدد غير موجود', 404);
 
     $hash = password_hash($pass, PASSWORD_BCRYPT, ['cost' => 12]);
     try {
         $pdo->prepare(
-            'INSERT INTO users (name, email, password_hash, role, branch_code, is_active)
-             VALUES (?,?,?,?,?,1)'
-        )->execute([$name, $email, $hash, $role, $branch]);
+            'INSERT INTO users (name, email, password_hash, role, branch_code, is_active, tenant_id)
+             VALUES (?,?,?,?,?,1,?)'
+        )->execute([$name, $email, $hash, $role, $branch, $tenantId]);
     } catch (Exception $e) {
         json_error('تعذّر إنشاء المستخدم — قد يكون البريد مستخدماً مسبقاً', 400);
     }
 
-    audit("dev_panel: create user $email (role=$role)", 'developer');
+    audit("dev_panel: create user $email (role=$role, tenant_id=$tenantId)", 'developer', 'info', $tenantId);
     json_ok(['success' => true]);
 }
 

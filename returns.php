@@ -10,21 +10,24 @@ $pdo    = db();
 
 switch ($method) {
     case 'GET': {
-        require_auth();
+        $auth = require_auth();
+        $tenantId = tenant_id_from_auth($auth);
         $invoiceId = trim($_GET['invoice_id'] ?? $_GET['invoiceId'] ?? '');
         if ($invoiceId !== '') {
             $stmt = $pdo->prepare(
-                'SELECT * FROM returns WHERE invoice_id = ? ORDER BY date DESC LIMIT 200'
+                'SELECT * FROM returns WHERE invoice_id = ? AND tenant_id = ? ORDER BY date DESC LIMIT 200'
             );
-            $stmt->execute([$invoiceId]);
+            $stmt->execute([$invoiceId, $tenantId]);
         } else {
-            $stmt = $pdo->query('SELECT * FROM returns ORDER BY date DESC LIMIT 200');
+            $stmt = $pdo->prepare('SELECT * FROM returns WHERE tenant_id = ? ORDER BY date DESC LIMIT 200');
+            $stmt->execute([$tenantId]);
         }
         json_ok($stmt->fetchAll());
         break;
     }
     case 'POST': {
-        require_auth();
+        $auth = require_auth();
+        $tenantId = tenant_id_from_auth($auth);
         $b = input_json();
         $id = trim($b['id'] ?? '');
         if ($id === '') $id = 'RT-' . time();
@@ -36,43 +39,47 @@ switch ($method) {
         if ($invoiceId === '') json_error('رقم الفاتورة مطلوب');
 
         $stmt = $pdo->prepare(
-            'INSERT INTO returns (id, invoice_id, reason, amount, date)
-             VALUES (?,?,?,?,?)
+            'INSERT INTO returns (id, tenant_id, invoice_id, reason, amount, date)
+             VALUES (?,?,?,?,?,?)
              ON CONFLICT (id) DO UPDATE SET
                 invoice_id = EXCLUDED.invoice_id,
                 reason     = EXCLUDED.reason,
                 amount     = EXCLUDED.amount,
-                date       = EXCLUDED.date'
+                date       = EXCLUDED.date
+             WHERE returns.tenant_id = EXCLUDED.tenant_id'
         );
-        $stmt->execute([$id, $invoiceId, $reason, $amount, $date]);
+        $stmt->execute([$id, $tenantId, $invoiceId, $reason, $amount, $date]);
 
         // 📦 إعادة المخزون عند تسجيل المرتجع (إن أُرسلت عناصر المرتجع)
         $items = $b['items'] ?? [];
         if (is_array($items)) {
             $up = $pdo->prepare(
                 'UPDATE products SET stock = stock + ?, sold = GREATEST(sold - ?, 0)
-                 WHERE sku = ? OR name = ?'
+                 WHERE (sku = ? OR name = ?) AND tenant_id = ?'
             );
             foreach ($items as $it) {
                 $sku  = $it['sku']  ?? '';
                 $name = $it['name'] ?? '';
                 $qty  = (int)($it['qty'] ?? 0);
                 if (($sku !== '' || $name !== '') && $qty > 0) {
-                    $up->execute([$qty, $qty, $sku, $name]);
+                    $up->execute([$qty, $qty, $sku, $name, $tenantId]);
                 }
             }
         }
 
-        audit("تسجيل مرتجع $id للفاتورة $invoiceId بقيمة $amount");
+        audit("تسجيل مرتجع $id للفاتورة $invoiceId بقيمة $amount", null, 'info', $tenantId);
         json_ok(['success' => true, 'id' => $id]);
         break;
     }
     case 'DELETE': {
         $auth = require_admin();
+        $tenantId = tenant_id_from_auth($auth);
         $id = trim($_GET['id'] ?? '');
         if ($id === '') json_error('id مطلوب');
-        $pdo->prepare('DELETE FROM returns WHERE id = ?')->execute([$id]);
-        audit("حذف مرتجع $id", $auth['email'] ?? null);
+        $stmt = $pdo->prepare('DELETE FROM returns WHERE id = ? AND tenant_id = ?');
+        $stmt->execute([$id, $tenantId]);
+        if ($stmt->rowCount() === 0) json_error('المرتجع غير موجود في متجرك', 404);
+        audit("حذف مرتجع $id", $auth['email'] ?? null, 'info', $tenantId);
         json_ok(['success' => true]);
         break;
     }

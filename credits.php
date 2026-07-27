@@ -28,10 +28,11 @@ switch ($method) {
     // ─────────────────────────────────────────────────────────────────────────
     case 'GET': {
         // ✅ إصلاح #5: حماية GET بالمصادقة
-        require_auth();
+        $auth = require_auth();
+        $tenantId = tenant_id_from_auth($auth);
         // ملخص إحصائي
         if (isset($_GET['summary'])) {
-            $row = $pdo->query("
+            $stmt = $pdo->prepare("
                 SELECT
                   COUNT(*)                        AS total_credits,
                   SUM(amount_yer)                 AS total_amount_yer,
@@ -44,26 +45,29 @@ switch ($method) {
                   SUM(CASE WHEN due_date IS NOT NULL AND due_date < NOW()
                               AND (amount_yer - paid_yer) > 0.01 THEN 1 ELSE 0 END) AS overdue_count
                 FROM credits
-            ")->fetch();
+                WHERE tenant_id = ?
+            ");
+            $stmt->execute([$tenantId]);
+            $row = $stmt->fetch();
             json_ok($row ?: []);
         }
 
         // قيد محدد بالـ ID
         if (!empty($_GET['id'])) {
-            $stmt = $pdo->prepare('SELECT * FROM credits WHERE id = ? LIMIT 1');
-            $stmt->execute([$_GET['id']]);
+            $stmt = $pdo->prepare('SELECT * FROM credits WHERE id = ? AND tenant_id = ? LIMIT 1');
+            $stmt->execute([$_GET['id'], $tenantId]);
             $credit = $stmt->fetch();
             if (!$credit) json_error('القيد غير موجود', 404);
             // إرفاق سجل الدفعات
-            $pmts = $pdo->prepare('SELECT * FROM credit_payments WHERE credit_id = ? ORDER BY date DESC');
-            $pmts->execute([$_GET['id']]);
+            $pmts = $pdo->prepare('SELECT * FROM credit_payments WHERE credit_id = ? AND tenant_id = ? ORDER BY date DESC');
+            $pmts->execute([$_GET['id'], $tenantId]);
             $credit['payments'] = $pmts->fetchAll();
             json_ok($credit);
         }
 
         // فلاتر متعددة
-        $sql  = 'SELECT * FROM credits WHERE 1=1';
-        $args = [];
+        $sql  = 'SELECT * FROM credits WHERE tenant_id = ?';
+        $args = [$tenantId];
         if (!empty($_GET['customer'])) {
             $sql .= ' AND customer_phone = ?';
             $args[] = $_GET['customer'];
@@ -94,7 +98,8 @@ switch ($method) {
     // POST — إنشاء قيد دَين جديد (عند البيع الآجل)
     // ─────────────────────────────────────────────────────────────────────────
     case 'POST': {
-        require_auth();
+        $auth = require_auth();
+        $tenantId = tenant_id_from_auth($auth);
         $body = input_json();
 
         $id            = $body['id']            ?? ('CR-' . round(microtime(true) * 1000));
@@ -116,23 +121,24 @@ switch ($method) {
         //    → ON CONFLICT (id) DO UPDATE SET ... = EXCLUDED.col
         $stmt = $pdo->prepare(
             'INSERT INTO credits
-               (id, customer_phone, invoice_id, amount_yer, amount_usd, exchange_rate,
+               (id, tenant_id, customer_phone, invoice_id, amount_yer, amount_usd, exchange_rate,
                 paid_yer, paid_usd, status, date, due_date, notes)
-             VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?, NOW(), ?, ?)
+             VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?, NOW(), ?, ?)
              ON CONFLICT (id) DO UPDATE SET
                 amount_yer    = EXCLUDED.amount_yer,
                 amount_usd    = EXCLUDED.amount_usd,
                 exchange_rate = EXCLUDED.exchange_rate,
                 status        = EXCLUDED.status,
                 due_date      = EXCLUDED.due_date,
-                notes         = EXCLUDED.notes'
+                notes         = EXCLUDED.notes
+             WHERE credits.tenant_id = EXCLUDED.tenant_id'
         );
         $stmt->execute([
-            $id, $customerPhone, $invoiceId,
+            $id, $tenantId, $customerPhone, $invoiceId,
             $amountYer, $amountUsd, $exchangeRate,
             $status, $dueDate, $notes,
         ]);
-        audit("create credit $id for $customerPhone amount=$amountYer YER");
+        audit("create credit $id for $customerPhone amount=$amountYer YER", null, 'info', $tenantId);
         json_ok(['success' => true, 'id' => $id]);
         break;
     }
@@ -141,7 +147,8 @@ switch ($method) {
     // PUT — تحديث قيد (تاريخ الاستحقاق، الملاحظات، الحالة)
     // ─────────────────────────────────────────────────────────────────────────
     case 'PUT': {
-        require_auth();
+        $auth = require_auth();
+        $tenantId = tenant_id_from_auth($auth);
         $id = $_GET['id'] ?? '';
         if ($id === '') json_error('id مطلوب');
         $body = input_json();
@@ -156,9 +163,11 @@ switch ($method) {
         }
         if (!$sets) json_error('لا توجد حقول للتحديث');
         $args[] = $id;
-        $stmt = $pdo->prepare('UPDATE credits SET ' . implode(', ', $sets) . ' WHERE id = ?');
+        $args[] = $tenantId;
+        $stmt = $pdo->prepare('UPDATE credits SET ' . implode(', ', $sets) . ' WHERE id = ? AND tenant_id = ?');
         $stmt->execute($args);
-        audit("update credit $id");
+        if ($stmt->rowCount() === 0) json_error('القيد غير موجود في متجرك', 404);
+        audit("update credit $id", null, 'info', $tenantId);
         json_ok(['success' => true]);
         break;
     }
@@ -167,11 +176,14 @@ switch ($method) {
     // DELETE — حذف قيد (للمدير فقط)
     // ─────────────────────────────────────────────────────────────────────────
     case 'DELETE': {
-        require_admin();
+        $auth = require_admin();
+        $tenantId = tenant_id_from_auth($auth);
         $id = $_GET['id'] ?? '';
         if ($id === '') json_error('id مطلوب');
-        $pdo->prepare('DELETE FROM credits WHERE id = ?')->execute([$id]);
-        audit("delete credit $id", null, 'warning');
+        $stmt = $pdo->prepare('DELETE FROM credits WHERE id = ? AND tenant_id = ?');
+        $stmt->execute([$id, $tenantId]);
+        if ($stmt->rowCount() === 0) json_error('القيد غير موجود في متجرك', 404);
+        audit("delete credit $id", null, 'warning', $tenantId);
         json_ok(['success' => true]);
         break;
     }

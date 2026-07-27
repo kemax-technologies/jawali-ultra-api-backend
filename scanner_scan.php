@@ -139,7 +139,7 @@ if ($idemKey !== '' && strlen($idemKey) > 128) $idemKey = substr($idemKey, 0, 12
 try {
     $stmt = db()->prepare(
         'SELECT id, status, expires_at, device_fingerprint,
-                rate_window_start, rate_count, scan_count
+                rate_window_start, rate_count, scan_count, tenant_id
          FROM scanner_sessions WHERE id = ? LIMIT 1'
     );
     $stmt->execute([$sessionId]);
@@ -150,6 +150,9 @@ try {
 }
 
 if (!$row) json_error('الجلسة غير موجودة', 404);
+
+// ── tenant_id مأخوذ من الجلسة نفسها (لا يوجد JWT في هذا الـ endpoint) ────────
+$tenantId = $row['tenant_id'] ?? null;
 
 // ── تحقق من الانتهاء ─────────────────────────────────────────────────────────
 if (strtotime($row['expires_at']) < time()) {
@@ -165,7 +168,7 @@ if (in_array($row['status'], ['closed','expired'], true)) {
 // ── ✅ التحقق من توقيع HMAC ──────────────────────────────────────────────────
 // إذا أرسل التطبيق توقيعًا، نتحقق منه؛ وإن لم يُرسَل من الويب الاحتياطي نتجاوزه
 if ($sig !== '' && !scanner_verify_hmac($sessionId, $code, $sig)) {
-    audit("scanner_hmac_fail id=$sessionId", null, 'warn');
+    audit("scanner_hmac_fail id=$sessionId", null, 'warn', $tenantId);
     json_error('توقيع الباركود غير صحيح', 403);
 }
 
@@ -181,7 +184,7 @@ if ($row['device_fingerprint'] === null) {
     } catch (Exception $e) { /* نستمر */ }
 } elseif ($row['device_fingerprint'] !== $fingerprint) {
     // جهاز مختلف يحاول استخدام الجلسة
-    audit("scanner_device_mismatch id=$sessionId", null, 'warn');
+    audit("scanner_device_mismatch id=$sessionId", null, 'warn', $tenantId);
     json_error('هذه الجلسة مرتبطة بجهاز آخر', 403);
 }
 
@@ -198,7 +201,7 @@ if ($now - $windowStart >= SCANNER_RATE_WINDOW) {
 
 $windowCount++;
 if ($windowCount > SCANNER_RATE_LIMIT) {
-    audit("scanner_rate_limit id=$sessionId", null, 'warn');
+    audit("scanner_rate_limit id=$sessionId", null, 'warn', $tenantId);
     json_error('تجاوزت الحد المسموح به من المسحات (' . SCANNER_RATE_LIMIT . '/دقيقة). حاول لاحقاً.', 429);
 }
 
@@ -210,11 +213,11 @@ try {
         // (يعتمد على قيد uq_idempotency الموجود في scanner_codes)
         // محاولة إدراج — إذا كان المفتاح مكرراً يُتجاهَل بصمت
         $stmtInsert = db()->prepare(
-            'INSERT INTO scanner_codes (session_id, code, idempotency_key)
-             VALUES (?, ?, ?)
+            'INSERT INTO scanner_codes (session_id, code, idempotency_key, tenant_id)
+             VALUES (?, ?, ?, ?)
              ON CONFLICT (session_id, idempotency_key) DO NOTHING'
         );
-        $stmtInsert->execute([$sessionId, $code, $idemKey]);
+        $stmtInsert->execute([$sessionId, $code, $idemKey, $tenantId]);
         if ($stmtInsert->rowCount() === 0) {
             // نفس العملية أُرسلت من قبل — نعيد نجاحًا بصمت (Idempotent)
             json_ok([
@@ -228,9 +231,9 @@ try {
         $newCodeId = (int)db()->lastInsertId();
     } else {
         $stmtInsert = db()->prepare(
-            'INSERT INTO scanner_codes (session_id, code) VALUES (?, ?)'
+            'INSERT INTO scanner_codes (session_id, code, tenant_id) VALUES (?, ?, ?)'
         );
-        $stmtInsert->execute([$sessionId, $code]);
+        $stmtInsert->execute([$sessionId, $code, $tenantId]);
         $newCodeId = (int)db()->lastInsertId();
     }
 } catch (Exception $e) {
@@ -263,7 +266,7 @@ try {
     json_error('خطأ داخلي في الخادم', 500);
 }
 
-audit("scanner_scan id=$sessionId code=$code code_id=$newCodeId", null, 'info');
+audit("scanner_scan id=$sessionId code=$code code_id=$newCodeId", null, 'info', $tenantId);
 
 json_ok([
     'success'     => true,

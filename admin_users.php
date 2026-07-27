@@ -14,6 +14,7 @@
 require_once __DIR__ . '/_admin_db.php';
 
 $auth   = require_admin_web();
+$tenantId = tenant_id_from_auth($auth);
 $pdo    = db();
 $method = $_SERVER['REQUEST_METHOD'];
 $action = $_GET['action'] ?? '';
@@ -25,10 +26,10 @@ switch ($method) {
                 'SELECT u.id, u.name, u.email, u.role, u.is_active, u.branch_code, u.permissions, u.created_at,
                         b.name AS branch_name
                  FROM users u
-                 LEFT JOIN branches b ON b.code = u.branch_code
-                 WHERE u.id = ? LIMIT 1'
+                 LEFT JOIN branches b ON b.code = u.branch_code AND b.tenant_id = u.tenant_id
+                 WHERE u.id = ? AND u.tenant_id = ? LIMIT 1'
             );
-            $stmt->execute([(int)$_GET['id']]);
+            $stmt->execute([(int)$_GET['id'], $tenantId]);
             $u = $stmt->fetch();
             if (!$u) json_error('المستخدم غير موجود', 404);
             $u['effective_permissions'] = effective_permissions((string)$u['role'], $u['permissions']);
@@ -40,9 +41,9 @@ switch ($method) {
                         COALESCE(SUM(total),0)   AS sales,
                         COALESCE(AVG(total),0)   AS avg_invoice,
                         MAX(date)                AS last_activity
-                 FROM invoices WHERE user_email = ?'
+                 FROM invoices WHERE user_email = ? AND tenant_id = ?'
             );
-            $stats->execute([$u['email']]);
+            $stats->execute([$u['email'], $tenantId]);
             $u['stats'] = $stats->fetch();
             json_ok($u);
         }
@@ -50,13 +51,14 @@ switch ($method) {
         $branch = current_branch();
         $sql = 'SELECT u.id, u.name, u.email, u.role, u.is_active, u.branch_code, u.permissions, u.created_at,
                        b.name AS branch_name,
-                       (SELECT COUNT(*)            FROM invoices i WHERE i.user_email=u.email) AS invoices_count,
-                       (SELECT COALESCE(SUM(total),0) FROM invoices i WHERE i.user_email=u.email) AS total_sales,
-                       (SELECT MAX(date)           FROM invoices i WHERE i.user_email=u.email) AS last_activity
+                       (SELECT COUNT(*)            FROM invoices i WHERE i.user_email=u.email AND i.tenant_id=u.tenant_id) AS invoices_count,
+                       (SELECT COALESCE(SUM(total),0) FROM invoices i WHERE i.user_email=u.email AND i.tenant_id=u.tenant_id) AS total_sales,
+                       (SELECT MAX(date)           FROM invoices i WHERE i.user_email=u.email AND i.tenant_id=u.tenant_id) AS last_activity
                 FROM users u
-                LEFT JOIN branches b ON b.code = u.branch_code';
-        $args = [];
-        if ($branch) { $sql .= ' WHERE u.branch_code = ?'; $args[] = $branch; }
+                LEFT JOIN branches b ON b.code = u.branch_code AND b.tenant_id = u.tenant_id
+                WHERE u.tenant_id = ?';
+        $args = [$tenantId];
+        if ($branch) { $sql .= ' AND u.branch_code = ?'; $args[] = $branch; }
         $sql .= ' ORDER BY u.id DESC';
 
         $stmt = $pdo->prepare($sql);
@@ -81,9 +83,10 @@ switch ($method) {
                 json_error('البريد وكلمة مرور 6 أحرف على الأقل');
             }
             $hash = password_hash($pass, PASSWORD_BCRYPT, ['cost' => 12]);
-            $pdo->prepare('UPDATE users SET password_hash = ? WHERE email = ?')
-                ->execute([$hash, $email]);
-            audit("reset password for $email", $auth['email'] ?? null);
+            $upd = $pdo->prepare('UPDATE users SET password_hash = ? WHERE email = ? AND tenant_id = ?');
+            $upd->execute([$hash, $email, $tenantId]);
+            if ($upd->rowCount() === 0) json_error('المستخدم غير موجود في متجرك', 404);
+            audit("reset password for $email", $auth['email'] ?? null, 'info', $tenantId);
             json_ok(['success' => true]);
         }
 
@@ -94,9 +97,10 @@ switch ($method) {
             if ($email === ($auth['email'] ?? '')) {
                 json_error('لا يمكنك تعطيل حسابك الخاص', 400);
             }
-            $pdo->prepare('UPDATE users SET is_active = 1 - is_active WHERE email = ?')
-                ->execute([$email]);
-            audit("toggle user $email", $auth['email'] ?? null);
+            $upd = $pdo->prepare('UPDATE users SET is_active = 1 - is_active WHERE email = ? AND tenant_id = ?');
+            $upd->execute([$email, $tenantId]);
+            if ($upd->rowCount() === 0) json_error('المستخدم غير موجود في متجرك', 404);
+            audit("toggle user $email", $auth['email'] ?? null, 'info', $tenantId);
             json_ok(['success' => true]);
         }
 
@@ -105,13 +109,14 @@ switch ($method) {
             $email = strtolower(trim($b['email'] ?? ''));
             $code  = strtoupper(trim($b['branch_code'] ?? ''));
             if ($email === '' || $code === '') json_error('البريد ورمز الفرع مطلوبان');
-            // تحقق من وجود الفرع
-            $exists = $pdo->prepare('SELECT 1 FROM branches WHERE code = ? AND is_active = 1');
-            $exists->execute([$code]);
+            // تحقق من وجود الفرع ضمن المتجر الحالي
+            $exists = $pdo->prepare('SELECT 1 FROM branches WHERE code = ? AND tenant_id = ? AND is_active = 1');
+            $exists->execute([$code, $tenantId]);
             if (!$exists->fetch()) json_error('الفرع غير موجود أو غير نشط');
-            $pdo->prepare('UPDATE users SET branch_code = ? WHERE email = ?')
-                ->execute([$code, $email]);
-            audit("move user $email to $code", $auth['email'] ?? null);
+            $upd = $pdo->prepare('UPDATE users SET branch_code = ? WHERE email = ? AND tenant_id = ?');
+            $upd->execute([$code, $email, $tenantId]);
+            if ($upd->rowCount() === 0) json_error('المستخدم غير موجود في متجرك', 404);
+            audit("move user $email to $code", $auth['email'] ?? null, 'info', $tenantId);
             json_ok(['success' => true]);
         }
 
@@ -142,18 +147,27 @@ switch ($method) {
             ? password_hash($b['password'], PASSWORD_BCRYPT, ['cost' => 12])
             : null;
 
+        // ✅ Multi-Tenant: البريد الإلكتروني فريد عالمياً — إن كان مستخدَماً من متجر آخر، يُمنع الاستيلاء عليه
+        $existing = $pdo->prepare('SELECT tenant_id FROM users WHERE email = ? LIMIT 1');
+        $existing->execute([$email]);
+        $existingRow = $existing->fetch();
+        if ($existingRow && (int)$existingRow['tenant_id'] !== $tenantId) {
+            json_error('البريد الإلكتروني مستخدم في متجر آخر', 409);
+        }
+
         // ✅ تحويل PostgreSQL: ON DUPLICATE KEY UPDATE ... VALUES(col) → ON CONFLICT (email) DO UPDATE SET ... EXCLUDED.col
         $stmt = $pdo->prepare(
-            'INSERT INTO users (name, email, password_hash, role, branch_code, is_active, permissions)
-             VALUES (?,?,?,?,?,?,?)
+            'INSERT INTO users (name, email, password_hash, role, branch_code, is_active, permissions, tenant_id)
+             VALUES (?,?,?,?,?,?,?,?)
              ON CONFLICT (email) DO UPDATE SET
                 name = EXCLUDED.name, role = EXCLUDED.role,
                 branch_code = EXCLUDED.branch_code, is_active = EXCLUDED.is_active,
                 permissions = COALESCE(EXCLUDED.permissions, users.permissions),
-                password_hash = COALESCE(EXCLUDED.password_hash, users.password_hash)'
+                password_hash = COALESCE(EXCLUDED.password_hash, users.password_hash)
+             WHERE users.tenant_id = EXCLUDED.tenant_id'
         );
-        $stmt->execute([$name, $email, $hash, $role, $branch, $active, $permissionsJson]);
-        audit("upsert user $email (branch=$branch, role=$role)", $auth['email'] ?? null);
+        $stmt->execute([$name, $email, $hash, $role, $branch, $active, $permissionsJson, $tenantId]);
+        audit("upsert user $email (branch=$branch, role=$role)", $auth['email'] ?? null, 'info', $tenantId);
         json_ok(['success' => true]);
         break;
     }
@@ -164,8 +178,10 @@ switch ($method) {
         if ($email === ($auth['email'] ?? '')) {
             json_error('لا يمكنك حذف حسابك الخاص', 400);
         }
-        $pdo->prepare('UPDATE users SET is_active = 0 WHERE email = ?')->execute([$email]);
-        audit("deactivate user $email", $auth['email'] ?? null);
+        $del = $pdo->prepare('UPDATE users SET is_active = 0 WHERE email = ? AND tenant_id = ?');
+        $del->execute([$email, $tenantId]);
+        if ($del->rowCount() === 0) json_error('المستخدم غير موجود في متجرك', 404);
+        audit("deactivate user $email", $auth['email'] ?? null, 'info', $tenantId);
         json_ok(['success' => true]);
         break;
     }

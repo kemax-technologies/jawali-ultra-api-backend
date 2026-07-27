@@ -25,11 +25,12 @@ switch ($method) {
     // GET
     // ─────────────────────────────────────────────────────────────────────────
     case 'GET': {
-        require_auth();
+        $auth = require_auth();
+        $tenantId = tenant_id_from_auth($auth);
 
         if (isset($_GET['payroll'])) {
-            $sql  = 'SELECT * FROM payroll_runs WHERE 1=1';
-            $args = [];
+            $sql  = 'SELECT * FROM payroll_runs WHERE tenant_id = ?';
+            $args = [$tenantId];
             if (!empty($_GET['employee_id'])) {
                 $sql .= ' AND employee_id = ?';
                 $args[] = $_GET['employee_id'];
@@ -41,12 +42,13 @@ switch ($method) {
         }
 
         if (!empty($_GET['id'])) {
-            $stmt = $pdo->prepare('SELECT * FROM employees WHERE id = ? LIMIT 1');
-            $stmt->execute([$_GET['id']]);
+            $stmt = $pdo->prepare('SELECT * FROM employees WHERE id = ? AND tenant_id = ? LIMIT 1');
+            $stmt->execute([$_GET['id'], $tenantId]);
             json_ok($stmt->fetch() ?: []);
         }
 
-        $stmt = $pdo->query('SELECT * FROM employees ORDER BY created_at ASC');
+        $stmt = $pdo->prepare('SELECT * FROM employees WHERE tenant_id = ? ORDER BY created_at ASC');
+        $stmt->execute([$tenantId]);
         json_ok($stmt->fetchAll());
         break;
     }
@@ -55,7 +57,8 @@ switch ($method) {
     // POST — إنشاء/تحديث موظف، أو صرف راتب
     // ─────────────────────────────────────────────────────────────────────────
     case 'POST': {
-        require_auth();
+        $auth = require_auth();
+        $tenantId = tenant_id_from_auth($auth);
         $action = $_GET['action'] ?? '';
         $body   = input_json();
 
@@ -72,8 +75,8 @@ switch ($method) {
                 json_error('employee_id و period مطلوبان');
             }
 
-            $empStmt = $pdo->prepare('SELECT * FROM employees WHERE id = ? LIMIT 1');
-            $empStmt->execute([$employeeId]);
+            $empStmt = $pdo->prepare('SELECT * FROM employees WHERE id = ? AND tenant_id = ? LIMIT 1');
+            $empStmt->execute([$employeeId, $tenantId]);
             $emp = $empStmt->fetch();
             if (!$emp) json_error('الموظف غير موجود', 404);
 
@@ -87,8 +90,8 @@ switch ($method) {
                 $pdo->beginTransaction();
 
                 if ($cashAccountId !== '') {
-                    $accStmt = $pdo->prepare('SELECT * FROM cash_accounts WHERE id = ? LIMIT 1');
-                    $accStmt->execute([$cashAccountId]);
+                    $accStmt = $pdo->prepare('SELECT * FROM cash_accounts WHERE id = ? AND tenant_id = ? LIMIT 1');
+                    $accStmt->execute([$cashAccountId, $tenantId]);
                     $acc = $accStmt->fetch();
                     if (!$acc) {
                         $pdo->rollBack();
@@ -98,28 +101,28 @@ switch ($method) {
                         $pdo->rollBack();
                         json_error('الرصيد غير كافٍ في الصندوق المحدد لصرف الراتب');
                     }
-                    $pdo->prepare('UPDATE cash_accounts SET balance = balance - ? WHERE id = ?')
-                        ->execute([$netAmount, $cashAccountId]);
+                    $pdo->prepare('UPDATE cash_accounts SET balance = balance - ? WHERE id = ? AND tenant_id = ?')
+                        ->execute([$netAmount, $cashAccountId, $tenantId]);
 
                     $txId = 'TX-' . round(microtime(true) * 1000);
                     $pdo->prepare(
-                        'INSERT INTO cash_transactions (id, account_id, type, amount, currency, notes, created_by)
-                         VALUES (?, ?, ?, ?, ?, ?, ?)'
+                        'INSERT INTO cash_transactions (id, account_id, type, amount, currency, notes, created_by, tenant_id)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
                     )->execute([
                         $txId, $cashAccountId, 'صرف راتب', $netAmount, $emp['currency'],
-                        "راتب {$emp['name']} - $period", $_SERVER['HTTP_X_USER_EMAIL'] ?? null,
+                        "راتب {$emp['name']} - $period", $_SERVER['HTTP_X_USER_EMAIL'] ?? null, $tenantId,
                     ]);
                 }
 
                 $ins = $pdo->prepare(
                     'INSERT INTO payroll_runs
                        (id, employee_id, period, base_salary, allowances, deductions,
-                        net_amount, currency, cash_account_id, status, paid_at, notes)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, \'\'), \'paid\', NOW(), ?)'
+                        net_amount, currency, cash_account_id, status, paid_at, notes, tenant_id)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, \'\'), \'paid\', NOW(), ?, ?)'
                 );
                 $ins->execute([
                     $id, $employeeId, $period, $baseSalary, $allowances, $deductions,
-                    $netAmount, $emp['currency'], $cashAccountId, $notes,
+                    $netAmount, $emp['currency'], $cashAccountId, $notes, $tenantId,
                 ]);
 
                 $pdo->commit();
@@ -129,7 +132,7 @@ switch ($method) {
                 json_error('خطأ داخلي في الخادم', 500);
             }
 
-            audit("pay salary $id employee=$employeeId period=$period net=$netAmount");
+            audit("pay salary $id employee=$employeeId period=$period net=$netAmount", null, 'info', $tenantId);
             json_ok(['success' => true, 'id' => $id, 'net_amount' => $netAmount]);
             break;
         }
@@ -153,26 +156,27 @@ switch ($method) {
         if ($isNew) {
             $stmt = $pdo->prepare(
                 'INSERT INTO employees
-                   (id, name, phone, job_title, department, base_salary, currency, hire_date, status, notes)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, NULLIF(?, \'\')::date, ?, ?)'
+                   (id, name, phone, job_title, department, base_salary, currency, hire_date, status, notes, tenant_id)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, NULLIF(?, \'\')::date, ?, ?, ?)'
             );
             $stmt->execute([
                 $id, $name, $phone, $jobTitle, $department, $baseSalary,
-                $currency, $hireDate, $status, $notes,
+                $currency, $hireDate, $status, $notes, $tenantId,
             ]);
-            audit("create employee $id ($name)");
+            audit("create employee $id ($name)", null, 'info', $tenantId);
         } else {
             $stmt = $pdo->prepare(
                 'UPDATE employees SET
                     name = ?, phone = ?, job_title = ?, department = ?,
                     base_salary = ?, currency = ?, status = ?, notes = ?
-                 WHERE id = ?'
+                 WHERE id = ? AND tenant_id = ?'
             );
             $stmt->execute([
                 $name, $phone, $jobTitle, $department, $baseSalary,
-                $currency, $status, $notes, $id,
+                $currency, $status, $notes, $id, $tenantId,
             ]);
-            audit("update employee $id ($name)");
+            if ($stmt->rowCount() === 0) json_error('الموظف غير موجود في متجرك', 404);
+            audit("update employee $id ($name)", null, 'info', $tenantId);
         }
         json_ok(['success' => true, 'id' => $id]);
         break;
@@ -182,49 +186,52 @@ switch ($method) {
     // DELETE
     // ─────────────────────────────────────────────────────────────────────────
     case 'DELETE': {
-        require_admin();
+        $auth = require_admin();
+        $tenantId = tenant_id_from_auth($auth);
 
         if (isset($_GET['payroll'])) {
             $id = $_GET['id'] ?? '';
             if ($id === '') json_error('id مطلوب');
             try {
                 $pdo->beginTransaction();
-                $stmt = $pdo->prepare('SELECT * FROM payroll_runs WHERE id = ? LIMIT 1');
-                $stmt->execute([$id]);
+                $stmt = $pdo->prepare('SELECT * FROM payroll_runs WHERE id = ? AND tenant_id = ? LIMIT 1');
+                $stmt->execute([$id, $tenantId]);
                 $pr = $stmt->fetch();
                 if (!$pr) {
                     $pdo->rollBack();
                     json_error('سجل الراتب غير موجود', 404);
                 }
                 if (!empty($pr['cash_account_id']) && $pr['status'] === 'paid') {
-                    $pdo->prepare('UPDATE cash_accounts SET balance = balance + ? WHERE id = ?')
-                        ->execute([$pr['net_amount'], $pr['cash_account_id']]);
+                    $pdo->prepare('UPDATE cash_accounts SET balance = balance + ? WHERE id = ? AND tenant_id = ?')
+                        ->execute([$pr['net_amount'], $pr['cash_account_id'], $tenantId]);
                     $txId = 'TX-' . round(microtime(true) * 1000);
                     $pdo->prepare(
-                        'INSERT INTO cash_transactions (id, account_id, type, amount, currency, notes, created_by)
-                         VALUES (?, ?, ?, ?, ?, ?, ?)'
+                        'INSERT INTO cash_transactions (id, account_id, type, amount, currency, notes, created_by, tenant_id)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
                     )->execute([
                         $txId, $pr['cash_account_id'], 'عكس راتب محذوف',
                         $pr['net_amount'], $pr['currency'], "عكس راتب {$pr['period']}",
-                        $_SERVER['HTTP_X_USER_EMAIL'] ?? null,
+                        $_SERVER['HTTP_X_USER_EMAIL'] ?? null, $tenantId,
                     ]);
                 }
-                $pdo->prepare('DELETE FROM payroll_runs WHERE id = ?')->execute([$id]);
+                $pdo->prepare('DELETE FROM payroll_runs WHERE id = ? AND tenant_id = ?')->execute([$id, $tenantId]);
                 $pdo->commit();
             } catch (Exception $e) {
                 $pdo->rollBack();
                 error_log('[Jawali][employees] فشل حذف سجل الراتب: ' . $e->getMessage());
                 json_error('خطأ داخلي في الخادم', 500);
             }
-            audit("delete payroll run $id", null, 'warning');
+            audit("delete payroll run $id", null, 'warning', $tenantId);
             json_ok(['success' => true]);
             break;
         }
 
         $id = $_GET['id'] ?? '';
         if ($id === '') json_error('id مطلوب');
-        $pdo->prepare("UPDATE employees SET status = 'inactive' WHERE id = ?")->execute([$id]);
-        audit("deactivate employee $id", null, 'warning');
+        $upd = $pdo->prepare("UPDATE employees SET status = 'inactive' WHERE id = ? AND tenant_id = ?");
+        $upd->execute([$id, $tenantId]);
+        if ($upd->rowCount() === 0) json_error('الموظف غير موجود في متجرك', 404);
+        audit("deactivate employee $id", null, 'warning', $tenantId);
         json_ok(['success' => true]);
         break;
     }

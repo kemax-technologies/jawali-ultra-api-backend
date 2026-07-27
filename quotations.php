@@ -28,18 +28,19 @@ switch ($method) {
     // GET
     // ─────────────────────────────────────────────────────────────────────────
     case 'GET': {
-        require_auth();
+        $auth = require_auth();
+        $tenantId = tenant_id_from_auth($auth);
 
         if (!empty($_GET['id'])) {
-            $stmt = $pdo->prepare('SELECT * FROM quotations WHERE id = ? LIMIT 1');
-            $stmt->execute([$_GET['id']]);
+            $stmt = $pdo->prepare('SELECT * FROM quotations WHERE id = ? AND tenant_id = ? LIMIT 1');
+            $stmt->execute([$_GET['id'], $tenantId]);
             $row = $stmt->fetch();
             if ($row) $row['items'] = json_decode($row['items_json'] ?? '[]', true) ?: [];
             json_ok($row ?: []);
         }
 
-        $sql  = 'SELECT * FROM quotations WHERE 1=1';
-        $args = [];
+        $sql  = 'SELECT * FROM quotations WHERE tenant_id = ?';
+        $args = [$tenantId];
         if (!empty($_GET['type'])) {
             $sql .= ' AND type = ?';
             $args[] = $_GET['type'];
@@ -64,7 +65,8 @@ switch ($method) {
     // POST
     // ─────────────────────────────────────────────────────────────────────────
     case 'POST': {
-        require_auth();
+        $auth = require_auth();
+        $tenantId = tenant_id_from_auth($auth);
         $action = $_GET['action'] ?? '';
         $body   = input_json();
 
@@ -76,8 +78,10 @@ switch ($method) {
             if ($id === '' || !in_array($status, $allowed, true)) {
                 json_error('id و status صحيحان مطلوبان');
             }
-            $pdo->prepare('UPDATE quotations SET status = ? WHERE id = ?')->execute([$status, $id]);
-            audit("update quotation $id status=$status");
+            $stmt = $pdo->prepare('UPDATE quotations SET status = ? WHERE id = ? AND tenant_id = ?');
+            $stmt->execute([$status, $id, $tenantId]);
+            if ($stmt->rowCount() === 0) json_error('عرض السعر غير موجود في متجرك', 404);
+            audit("update quotation $id status=$status", null, 'info', $tenantId);
             json_ok(['success' => true]);
             break;
         }
@@ -87,8 +91,8 @@ switch ($method) {
             $id = trim($body['id'] ?? '');
             if ($id === '') json_error('id مطلوب');
 
-            $stmt = $pdo->prepare('SELECT * FROM quotations WHERE id = ? LIMIT 1');
-            $stmt->execute([$id]);
+            $stmt = $pdo->prepare('SELECT * FROM quotations WHERE id = ? AND tenant_id = ? LIMIT 1');
+            $stmt->execute([$id, $tenantId]);
             $q = $stmt->fetch();
             if (!$q) json_error('عرض السعر غير موجود', 404);
             if ($q['type'] !== 'sale') json_error('لا يمكن تحويل طلب شراء إلى فاتورة');
@@ -99,17 +103,17 @@ switch ($method) {
                 $pdo->beginTransaction();
                 $pdo->prepare(
                     'INSERT INTO invoices
-                       (id, customer_phone, user_email, date, subtotal, discount, tax, total,
+                       (id, tenant_id, customer_phone, user_email, date, subtotal, discount, tax, total,
                         payment_method, status, items_json)
-                     VALUES (?, ?, ?, NOW(), ?, ?, ?, ?, ?, ?, ?)'
+                     VALUES (?, ?, ?, ?, NOW(), ?, ?, ?, ?, ?, ?, ?)'
                 )->execute([
-                    $invoiceId, $q['party_phone'], $_SERVER['HTTP_X_USER_EMAIL'] ?? '',
+                    $invoiceId, $tenantId, $q['party_phone'], $_SERVER['HTTP_X_USER_EMAIL'] ?? '',
                     $q['subtotal'], $q['discount'], $q['tax'], $q['total'],
                     'نقدي', 'مكتملة', $q['items_json'],
                 ]);
                 $pdo->prepare(
-                    "UPDATE quotations SET status = 'converted', converted_invoice_id = ? WHERE id = ?"
-                )->execute([$invoiceId, $id]);
+                    "UPDATE quotations SET status = 'converted', converted_invoice_id = ? WHERE id = ? AND tenant_id = ?"
+                )->execute([$invoiceId, $id, $tenantId]);
                 $pdo->commit();
             } catch (Exception $e) {
                 $pdo->rollBack();
@@ -117,7 +121,7 @@ switch ($method) {
                 json_error('خطأ داخلي في الخادم', 500);
             }
 
-            audit("convert quotation $id to invoice $invoiceId");
+            audit("convert quotation $id to invoice $invoiceId", null, 'info', $tenantId);
             json_ok(['success' => true, 'invoice_id' => $invoiceId]);
             break;
         }
@@ -147,18 +151,18 @@ switch ($method) {
 
         $stmt = $pdo->prepare(
             'INSERT INTO quotations
-               (id, quote_number, type, party_name, party_phone, items_json,
+               (id, tenant_id, quote_number, type, party_name, party_phone, items_json,
                 subtotal, discount, tax, total, currency, valid_until, status, notes, date, created_by)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, \'\')::date, \'draft\', ?, NOW(), ?)'
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, \'\')::date, \'draft\', ?, NOW(), ?)'
         );
         $stmt->execute([
-            $id, $quoteNumber, $type, $partyName, $partyPhone,
+            $id, $tenantId, $quoteNumber, $type, $partyName, $partyPhone,
             json_encode($items, JSON_UNESCAPED_UNICODE),
             $subtotal, $discount, $tax, $total, $currency, $validUntil, $notes,
             $_SERVER['HTTP_X_USER_EMAIL'] ?? '',
         ]);
 
-        audit("create quotation $id type=$type total=$total party=$partyName");
+        audit("create quotation $id type=$type total=$total party=$partyName", null, 'info', $tenantId);
         json_ok(['success' => true, 'id' => $id, 'quote_number' => $quoteNumber]);
         break;
     }
@@ -167,11 +171,14 @@ switch ($method) {
     // DELETE
     // ─────────────────────────────────────────────────────────────────────────
     case 'DELETE': {
-        require_admin();
+        $auth = require_admin();
+        $tenantId = tenant_id_from_auth($auth);
         $id = $_GET['id'] ?? '';
         if ($id === '') json_error('id مطلوب');
-        $pdo->prepare('DELETE FROM quotations WHERE id = ?')->execute([$id]);
-        audit("delete quotation $id", null, 'warning');
+        $stmt = $pdo->prepare('DELETE FROM quotations WHERE id = ? AND tenant_id = ?');
+        $stmt->execute([$id, $tenantId]);
+        if ($stmt->rowCount() === 0) json_error('عرض السعر غير موجود في متجرك', 404);
+        audit("delete quotation $id", null, 'warning', $tenantId);
         json_ok(['success' => true]);
         break;
     }

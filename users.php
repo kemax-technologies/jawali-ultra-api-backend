@@ -6,12 +6,17 @@ $pdo    = db();
 
 // ✅ إصلاح #7: جميع عمليات المستخدمين تتطلب دور مدير
 $auth = require_admin();
+// ✅ Multi-Tenant: كل عملية هنا مقيّدة بمتجر المدير الحالي فقط — يمنع أي
+// مدير متجر من رؤية/تعديل/حذف مستخدمي متجر آخر.
+$tenantId = tenant_id_from_auth($auth);
 
 switch ($method) {
     case 'GET': {
-        $rows = $pdo->query(
-            'SELECT id, name, email, role, is_active, permissions, created_at FROM users ORDER BY id DESC'
-        )->fetchAll();
+        $stmt = $pdo->prepare(
+            'SELECT id, name, email, role, is_active, permissions, created_at FROM users WHERE tenant_id = ? ORDER BY id DESC'
+        );
+        $stmt->execute([$tenantId]);
+        $rows = $stmt->fetchAll();
         foreach ($rows as &$r) {
             $r['effective_permissions'] = effective_permissions((string)$r['role'], $r['permissions']);
             $r['permissions'] = $r['permissions'] ? json_decode($r['permissions'], true) : null;
@@ -46,21 +51,31 @@ switch ($method) {
             $permissionsJson = json_encode($filtered, JSON_UNESCAPED_UNICODE);
         }
 
+        // ✅ Multi-Tenant: البريد الإلكتروني فريد عالمياً — إن كان مستخدَماً من
+        // متجر آخر يجب منع الاستيلاء عليه/تعديله عبر هذا الـ endpoint.
+        $existing = $pdo->prepare('SELECT tenant_id FROM users WHERE email = ? LIMIT 1');
+        $existing->execute([$email]);
+        $existingRow = $existing->fetch();
+        if ($existingRow && (int)$existingRow['tenant_id'] !== $tenantId) {
+            json_error('البريد الإلكتروني مستخدم في متجر آخر', 409);
+        }
+
         // ✅ تحويل PostgreSQL: ON DUPLICATE KEY UPDATE ... VALUES(col)
         //    → ON CONFLICT DO UPDATE SET ... = EXCLUDED.col
         //    COALESCE(VALUES(password_hash), users.password_hash) يترجم مباشرة
         //    إلى COALESCE(EXCLUDED.password_hash, users.password_hash) — نفس المنطق
         //    (يحافظ على كلمة المرور القديمة إذا لم تُرسَل كلمة مرور جديدة)
         $stmt = $pdo->prepare(
-            'INSERT INTO users (name, email, password_hash, role, permissions)
-             VALUES (?,?,?,?,?)
+            'INSERT INTO users (name, email, password_hash, role, permissions, tenant_id)
+             VALUES (?,?,?,?,?,?)
              ON CONFLICT (email) DO UPDATE SET
                 name = EXCLUDED.name, role = EXCLUDED.role,
                 permissions = COALESCE(EXCLUDED.permissions, users.permissions),
-                password_hash = COALESCE(EXCLUDED.password_hash, users.password_hash)'
+                password_hash = COALESCE(EXCLUDED.password_hash, users.password_hash)
+             WHERE users.tenant_id = EXCLUDED.tenant_id'
         );
-        $stmt->execute([$name, $email, $hash, $role, $permissionsJson]);
-        audit("upsert user $email (role=$role)", $auth['email'] ?? null);
+        $stmt->execute([$name, $email, $hash, $role, $permissionsJson, $tenantId]);
+        audit("upsert user $email (role=$role)", $auth['email'] ?? null, 'info', $tenantId);
         json_ok(['success' => true]);
         break;
     }
@@ -71,8 +86,12 @@ switch ($method) {
         if ($email === ($auth['email'] ?? '')) {
             json_error('لا يمكنك حذف حسابك الخاص', 400);
         }
-        $pdo->prepare('UPDATE users SET is_active = 0 WHERE email = ?')->execute([$email]);
-        audit("deactivate user $email", $auth['email'] ?? null);
+        $stmt = $pdo->prepare('UPDATE users SET is_active = 0 WHERE email = ? AND tenant_id = ?');
+        $stmt->execute([$email, $tenantId]);
+        if ($stmt->rowCount() === 0) {
+            json_error('المستخدم غير موجود في متجرك', 404);
+        }
+        audit("deactivate user $email", $auth['email'] ?? null, 'info', $tenantId);
         json_ok(['success' => true]);
         break;
     }

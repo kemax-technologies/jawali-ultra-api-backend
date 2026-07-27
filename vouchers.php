@@ -24,16 +24,17 @@ switch ($method) {
     // GET
     // ─────────────────────────────────────────────────────────────────────────
     case 'GET': {
-        require_auth();
+        $auth = require_auth();
+        $tenantId = tenant_id_from_auth($auth);
 
         if (!empty($_GET['id'])) {
-            $stmt = $pdo->prepare('SELECT * FROM vouchers WHERE id = ? LIMIT 1');
-            $stmt->execute([$_GET['id']]);
+            $stmt = $pdo->prepare('SELECT * FROM vouchers WHERE id = ? AND tenant_id = ? LIMIT 1');
+            $stmt->execute([$_GET['id'], $tenantId]);
             json_ok($stmt->fetch() ?: []);
         }
 
-        $sql  = 'SELECT * FROM vouchers WHERE 1=1';
-        $args = [];
+        $sql  = 'SELECT * FROM vouchers WHERE tenant_id = ?';
+        $args = [$tenantId];
         if (!empty($_GET['type'])) {
             $sql .= ' AND type = ?';
             $args[] = $_GET['type'];
@@ -49,7 +50,8 @@ switch ($method) {
     // POST — إنشاء سند قبض/صرف + تحديث رصيد الصندوق (إن وُجد)
     // ─────────────────────────────────────────────────────────────────────────
     case 'POST': {
-        require_auth();
+        $auth = require_auth();
+        $tenantId = tenant_id_from_auth($auth);
         $body = input_json();
 
         $type = $body['type'] ?? 'receipt'; // receipt | payment
@@ -77,8 +79,8 @@ switch ($method) {
 
             // إذا مرتبط بصندوق: حدّث الرصيد + سجل حركة صندوق
             if ($cashAccountId !== '') {
-                $accStmt = $pdo->prepare('SELECT * FROM cash_accounts WHERE id = ? LIMIT 1');
-                $accStmt->execute([$cashAccountId]);
+                $accStmt = $pdo->prepare('SELECT * FROM cash_accounts WHERE id = ? AND tenant_id = ? LIMIT 1');
+                $accStmt->execute([$cashAccountId, $tenantId]);
                 $acc = $accStmt->fetch();
                 if (!$acc) {
                     $pdo->rollBack();
@@ -91,15 +93,15 @@ switch ($method) {
                 }
 
                 $delta = ($type === 'receipt') ? $amount : -$amount;
-                $pdo->prepare('UPDATE cash_accounts SET balance = balance + ? WHERE id = ?')
-                    ->execute([$delta, $cashAccountId]);
+                $pdo->prepare('UPDATE cash_accounts SET balance = balance + ? WHERE id = ? AND tenant_id = ?')
+                    ->execute([$delta, $cashAccountId, $tenantId]);
 
                 $txId = 'TX-' . round(microtime(true) * 1000);
                 $pdo->prepare(
-                    'INSERT INTO cash_transactions (id, account_id, type, amount, currency, notes, created_by)
-                     VALUES (?, ?, ?, ?, ?, ?, ?)'
+                    'INSERT INTO cash_transactions (id, tenant_id, account_id, type, amount, currency, notes, created_by)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
                 )->execute([
-                    $txId, $cashAccountId,
+                    $txId, $tenantId, $cashAccountId,
                     $type === 'receipt' ? 'سند قبض' : 'سند صرف',
                     $amount, $currency,
                     "سند $voucherNumber - $partyName",
@@ -110,12 +112,12 @@ switch ($method) {
             // أدرج السند نفسه
             $ins = $pdo->prepare(
                 'INSERT INTO vouchers
-                   (id, type, voucher_number, party_name, party_phone, cash_account_id,
+                   (id, tenant_id, type, voucher_number, party_name, party_phone, cash_account_id,
                     amount, currency, category, description, date, created_by)
-                 VALUES (?, ?, ?, ?, ?, NULLIF(?, \'\'), ?, ?, ?, ?, NOW(), ?)'
+                 VALUES (?, ?, ?, ?, ?, ?, NULLIF(?, \'\'), ?, ?, ?, ?, NOW(), ?)'
             );
             $ins->execute([
-                $id, $type, $voucherNumber, $partyName, $partyPhone, $cashAccountId,
+                $id, $tenantId, $type, $voucherNumber, $partyName, $partyPhone, $cashAccountId,
                 $amount, $currency, $category, $description,
                 $_SERVER['HTTP_X_USER_EMAIL'] ?? '',
             ]);
@@ -127,7 +129,7 @@ switch ($method) {
             json_error('خطأ داخلي في الخادم', 500);
         }
 
-        audit("create voucher $id type=$type amount=$amount $currency party=$partyName");
+        audit("create voucher $id type=$type amount=$amount $currency party=$partyName", null, 'info', $tenantId);
         json_ok([
             'success'        => true,
             'id'             => $id,
@@ -140,14 +142,15 @@ switch ($method) {
     // DELETE — حذف سند (مدير فقط) + عكس أثره على رصيد الصندوق إن وُجد
     // ─────────────────────────────────────────────────────────────────────────
     case 'DELETE': {
-        require_admin();
+        $auth = require_admin();
+        $tenantId = tenant_id_from_auth($auth);
         $id = $_GET['id'] ?? '';
         if ($id === '') json_error('id مطلوب');
 
         try {
             $pdo->beginTransaction();
-            $stmt = $pdo->prepare('SELECT * FROM vouchers WHERE id = ? LIMIT 1');
-            $stmt->execute([$id]);
+            $stmt = $pdo->prepare('SELECT * FROM vouchers WHERE id = ? AND tenant_id = ? LIMIT 1');
+            $stmt->execute([$id, $tenantId]);
             $v = $stmt->fetch();
             if (!$v) {
                 $pdo->rollBack();
@@ -157,22 +160,22 @@ switch ($method) {
             // اعكس أثر السند على الصندوق إن كان مرتبطاً
             if (!empty($v['cash_account_id'])) {
                 $delta = ($v['type'] === 'receipt') ? -(float)$v['amount'] : (float)$v['amount'];
-                $pdo->prepare('UPDATE cash_accounts SET balance = balance + ? WHERE id = ?')
-                    ->execute([$delta, $v['cash_account_id']]);
+                $pdo->prepare('UPDATE cash_accounts SET balance = balance + ? WHERE id = ? AND tenant_id = ?')
+                    ->execute([$delta, $v['cash_account_id'], $tenantId]);
 
                 $txId = 'TX-' . round(microtime(true) * 1000);
                 $pdo->prepare(
-                    'INSERT INTO cash_transactions (id, account_id, type, amount, currency, notes, created_by)
-                     VALUES (?, ?, ?, ?, ?, ?, ?)'
+                    'INSERT INTO cash_transactions (id, tenant_id, account_id, type, amount, currency, notes, created_by)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
                 )->execute([
-                    $txId, $v['cash_account_id'], 'عكس سند محذوف',
+                    $txId, $tenantId, $v['cash_account_id'], 'عكس سند محذوف',
                     $v['amount'], $v['currency'],
                     "عكس سند {$v['voucher_number']}",
                     $_SERVER['HTTP_X_USER_EMAIL'] ?? null,
                 ]);
             }
 
-            $pdo->prepare('DELETE FROM vouchers WHERE id = ?')->execute([$id]);
+            $pdo->prepare('DELETE FROM vouchers WHERE id = ? AND tenant_id = ?')->execute([$id, $tenantId]);
             $pdo->commit();
         } catch (Exception $e) {
             $pdo->rollBack();
@@ -180,7 +183,7 @@ switch ($method) {
             json_error('خطأ داخلي في الخادم', 500);
         }
 
-        audit("delete voucher $id", null, 'warning');
+        audit("delete voucher $id", null, 'warning', $tenantId);
         json_ok(['success' => true]);
         break;
     }

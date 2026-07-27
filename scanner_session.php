@@ -70,7 +70,8 @@ function scanner_ensure_tables(): void {
         created_at          TIMESTAMP    NOT NULL,
         expires_at          TIMESTAMP    NOT NULL,
         client_ip           VARCHAR(64),
-        user_agent          VARCHAR(255)
+        user_agent          VARCHAR(255),
+        tenant_id           INTEGER
     )";
     db()->exec($sql_sessions);
     db()->exec("CREATE INDEX IF NOT EXISTS idx_status  ON scanner_sessions (status)");
@@ -83,6 +84,8 @@ function scanner_ensure_tables(): void {
         "ALTER TABLE scanner_sessions ADD COLUMN IF NOT EXISTS device_fingerprint VARCHAR(64)",
         "ALTER TABLE scanner_sessions ADD COLUMN IF NOT EXISTS rate_window_start TIMESTAMP",
         "ALTER TABLE scanner_sessions ADD COLUMN IF NOT EXISTS rate_count INT NOT NULL DEFAULT 0",
+        "ALTER TABLE scanner_sessions ADD COLUMN IF NOT EXISTS tenant_id INTEGER",
+        "ALTER TABLE scanner_codes ADD COLUMN IF NOT EXISTS tenant_id INTEGER",
     ];
     foreach ($upgrades as $sql) {
         try { db()->exec($sql); } catch (Exception $e) { /* العمود موجود مسبقاً */ }
@@ -96,6 +99,7 @@ function scanner_ensure_tables(): void {
         code             VARCHAR(255) NOT NULL,
         idempotency_key  VARCHAR(128),
         received_at      TIMESTAMP    NOT NULL DEFAULT NOW(),
+        tenant_id        INTEGER,
         CONSTRAINT uq_idempotency UNIQUE (session_id, idempotency_key)
     )";
     db()->exec($sql_codes);
@@ -139,6 +143,7 @@ $method = $_SERVER['REQUEST_METHOD'];
 if ($method === 'POST') {
     // ✅ إصلاح #4: require_auth() إلزامي — يوقف التنفيذ فوراً إذا لم يكن JWT صالحاً
     $auth   = require_auth();
+    $tenantId = tenant_id_from_auth($auth);
     $email  = $auth['email']       ?? null;
     $branch = $_SERVER['HTTP_X_BRANCH_CODE'] ?? ($auth['branch_code'] ?? null);
 
@@ -154,8 +159,8 @@ if ($method === 'POST') {
         // عمود/جدول في Postgres، لا كنص حرفي — استُبدلت بعلامات مفردة 'pending'
         $stmt = db()->prepare(
             "INSERT INTO scanner_sessions
-             (id, owner_email, branch_code, status, created_at, expires_at, client_ip, user_agent)
-             VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)"
+             (id, owner_email, branch_code, status, created_at, expires_at, client_ip, user_agent, tenant_id)
+             VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?)"
         );
         $stmt->execute([
             $id,
@@ -165,6 +170,7 @@ if ($method === 'POST') {
             $expiresAt,
             $_SERVER['REMOTE_ADDR'] ?? '',
             substr($_SERVER['HTTP_USER_AGENT'] ?? '', 0, 240),
+            $tenantId,
         ]);
     } catch (Exception $e) {
         error_log('[Jawali][scanner_session] فشل إنشاء الجلسة: ' . $e->getMessage());
@@ -187,7 +193,7 @@ if ($method === 'POST') {
         'rate_limit' => SCANNER_RATE_LIMIT,
     ];
 
-    audit("scanner_session_create id=$id", $email, 'info');
+    audit("scanner_session_create id=$id", $email, 'info', $tenantId);
 
     json_ok([
         'success'    => true,
@@ -202,7 +208,8 @@ if ($method === 'POST') {
 
 // ── GET → فحص الحالة (Polling) ──────────────────────────────────────────────
 if ($method === 'GET') {
-    require_auth();
+    $auth = require_auth();
+    $tenantId = tenant_id_from_auth($auth);
     $id = trim($_GET['id'] ?? '');
     if ($id === '') json_error('معرّف الجلسة مطلوب', 400);
 
@@ -227,9 +234,9 @@ if ($method === 'GET') {
             try {
                 $stmt = db()->prepare(
                     'SELECT id, status, scan_count, expires_at
-                     FROM scanner_sessions WHERE id = ? LIMIT 1'
+                     FROM scanner_sessions WHERE id = ? AND tenant_id = ? LIMIT 1'
                 );
-                $stmt->execute([$id]);
+                $stmt->execute([$id, $tenantId]);
                 $row = $stmt->fetch();
             } catch (Exception $e) { $row = null; }
 
@@ -243,7 +250,7 @@ if ($method === 'GET') {
             // تحقق من انتهاء الصلاحية
             if (strtotime($row['expires_at']) < time()) {
                 try {
-                    db()->prepare("UPDATE scanner_sessions SET status='expired' WHERE id=?")->execute([$id]);
+                    db()->prepare("UPDATE scanner_sessions SET status='expired' WHERE id=? AND tenant_id=?")->execute([$id, $tenantId]);
                 } catch (Exception $e) {}
                 echo "event: expired\n";
                 echo 'data: ' . json_encode(['session_id' => $id, 'expires_at' => $row['expires_at']]) . "\n\n";
@@ -256,11 +263,11 @@ if ($method === 'GET') {
                 $stmtQ = db()->prepare(
                     'SELECT id, code, received_at
                      FROM scanner_codes
-                     WHERE session_id = ? AND id > ?
+                     WHERE session_id = ? AND id > ? AND tenant_id = ?
                      ORDER BY id ASC
                      LIMIT 10'
                 );
-                $stmtQ->execute([$id, $lastId]);
+                $stmtQ->execute([$id, $lastId, $tenantId]);
                 $newCodes = $stmtQ->fetchAll();
             } catch (Exception $e) { $newCodes = []; }
 
@@ -295,9 +302,9 @@ if ($method === 'GET') {
     try {
         $stmt = db()->prepare(
             'SELECT id, status, last_code, last_code_at, last_code_id, scan_count, expires_at, created_at
-             FROM scanner_sessions WHERE id = ? LIMIT 1'
+             FROM scanner_sessions WHERE id = ? AND tenant_id = ? LIMIT 1'
         );
-        $stmt->execute([$id]);
+        $stmt->execute([$id, $tenantId]);
         $row = $stmt->fetch();
     } catch (Exception $e) {
         error_log('[Jawali][scanner_session] فشل قراءة الجلسة: ' . $e->getMessage());
@@ -309,7 +316,7 @@ if ($method === 'GET') {
     // تحقق من انتهاء الصلاحية
     if ($row['status'] !== 'expired' && strtotime($row['expires_at']) < time()) {
         try {
-            db()->prepare("UPDATE scanner_sessions SET status='expired' WHERE id=?")->execute([$id]);
+            db()->prepare("UPDATE scanner_sessions SET status='expired' WHERE id=? AND tenant_id=?")->execute([$id, $tenantId]);
         } catch (Exception $e) {}
         $row['status'] = 'expired';
     }
@@ -332,11 +339,15 @@ if ($method === 'GET') {
 if ($method === 'DELETE') {
     // ✅ إصلاح #4: حماية DELETE بالمصادقة أيضاً
     $auth = require_auth();
+    $tenantId = tenant_id_from_auth($auth);
     $id = trim($_GET['id'] ?? '');
     if ($id === '') json_error('معرّف الجلسة مطلوب', 400);
     try {
-        $stmt = db()->prepare("UPDATE scanner_sessions SET status='closed' WHERE id=?");
-        $stmt->execute([$id]);
+        $stmt = db()->prepare("UPDATE scanner_sessions SET status='closed' WHERE id=? AND tenant_id=?");
+        $stmt->execute([$id, $tenantId]);
+        if ($stmt->rowCount() === 0) {
+            json_error('الجلسة غير موجودة في متجرك', 404);
+        }
     } catch (Exception $e) {
         // ✅ إصلاح #7: لا نكشف تفاصيل الخطأ للمستخدم
         error_log('[Jawali][scanner_session] فشل إنهاء الجلسة: ' . $e->getMessage());

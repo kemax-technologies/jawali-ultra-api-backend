@@ -225,28 +225,53 @@ function find_or_create_social_user(string $provider, array $info): array {
         }
     }
 
-    // 3) إنشاء مستخدم جديد بدور كاشير
+    // 3) إنشاء مستخدم جديد — Multi-Tenant: التطبيق مُنشَر للعامة على متجر بلاي؛
+    // كل من يسجّل حساباً جديداً (حتى عبر مزوّد اجتماعي) يصبح تلقائياً صاحب
+    // متجر ("مدير") مستقل وخاص به بالكامل، بالضبط بنفس منطق auth.php?action=register
+    // (إنشاء tenant أولاً، ثم user مرتبط به، ثم ربط owner_user_id — كل ذلك
+    // ضمن معاملة واحدة ذرّية لمنع وجود مستخدم بلا متجر أو متجر بلا مالك).
     $name  = $info['name'] !== '' ? $info['name'] : 'مستخدم ' . substr($info['uid'], 0, 6);
     $email = $info['email'] !== '' ? $info['email'] : ($info['uid'] . '@social.local');
+    $storeName = 'متجر ' . $name;
 
-    $pdo->prepare(
-        'INSERT INTO users (name, email, password_hash, role, auth_provider, provider_uid,
-                            avatar_url, email_verified, is_active)
-         VALUES (?, ?, NULL, ?, ?, ?, ?, ?, 1)'
-    )->execute([
-        $name, $email, 'كاشير', $provider, $info['uid'],
-        $info['avatar'] ?? null,
-        $info['verified'] ? 1 : 0,
-    ]);
-    $newId = (int)$pdo->lastInsertId();
+    $newId = null;
+    $tenantId = null;
+    try {
+        $pdo->beginTransaction();
 
-    $pdo->prepare(
-        'INSERT INTO user_social_links (user_id, provider, provider_uid, provider_email)
-         VALUES (?, ?, ?, ?)
-         ON CONFLICT (provider, provider_uid) DO NOTHING'
-    )->execute([$newId, $provider, $info['uid'], $info['email']]);
+        $tIns = $pdo->prepare('INSERT INTO tenants (name, plan) VALUES (?, ?) RETURNING id');
+        $tIns->execute([$storeName, 'free']);
+        $tenantId = (int)$tIns->fetchColumn();
 
-    audit('تسجيل عبر ' . $provider, $email);
+        $uIns = $pdo->prepare(
+            'INSERT INTO users (name, email, password_hash, role, auth_provider, provider_uid,
+                                avatar_url, email_verified, is_active, tenant_id)
+             VALUES (?, ?, NULL, ?, ?, ?, ?, ?, 1, ?) RETURNING id'
+        );
+        $uIns->execute([
+            $name, $email, 'مدير', $provider, $info['uid'],
+            $info['avatar'] ?? null,
+            $info['verified'] ? 1 : 0,
+            $tenantId,
+        ]);
+        $newId = (int)$uIns->fetchColumn();
+
+        $pdo->prepare('UPDATE tenants SET owner_user_id = ? WHERE id = ?')->execute([$newId, $tenantId]);
+
+        $pdo->prepare(
+            'INSERT INTO user_social_links (user_id, provider, provider_uid, provider_email)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT (provider, provider_uid) DO NOTHING'
+        )->execute([$newId, $provider, $info['uid'], $info['email']]);
+
+        $pdo->commit();
+    } catch (Exception $e) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        error_log('[Jawali][social_auth] فشل إنشاء متجر جديد للمستخدم ' . $email . ': ' . $e->getMessage());
+        json_error('حدث خطأ أثناء إنشاء الحساب — حاول مرة أخرى', 500);
+    }
+
+    audit('تسجيل عبر ' . $provider . ' + إنشاء متجر مستقل', $email, 'info', $tenantId);
 
     $u = $pdo->prepare('SELECT * FROM users WHERE id=? LIMIT 1');
     $u->execute([$newId]);

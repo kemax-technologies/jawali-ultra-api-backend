@@ -6,20 +6,36 @@ $pdo    = db();
 
 // ✅ إصلاح #3: جميع عمليات المزامنة تتطلب مصادقة
 $auth = require_auth();
+$tenantId = tenant_id_from_auth($auth);
 
 switch ($method) {
     // ── جلب كل البيانات للتطبيق (Pull) ────────────────────────────────────────
     case 'GET': {
-        $products  = $pdo->query('SELECT * FROM products  ORDER BY name LIMIT 1000')->fetchAll();
-        $customers = $pdo->query('SELECT * FROM customers ORDER BY spent DESC LIMIT 1000')->fetchAll();
-        $invoices  = $pdo->query('SELECT * FROM invoices  ORDER BY date DESC LIMIT 500')->fetchAll();
+        $productsStmt = $pdo->prepare('SELECT * FROM products WHERE tenant_id = ? ORDER BY name LIMIT 1000');
+        $productsStmt->execute([$tenantId]);
+        $products = $productsStmt->fetchAll();
+
+        $customersStmt = $pdo->prepare('SELECT * FROM customers WHERE tenant_id = ? ORDER BY spent DESC LIMIT 1000');
+        $customersStmt->execute([$tenantId]);
+        $customers = $customersStmt->fetchAll();
+
+        $invoicesStmt = $pdo->prepare('SELECT * FROM invoices WHERE tenant_id = ? ORDER BY date DESC LIMIT 500');
+        $invoicesStmt->execute([$tenantId]);
+        $invoices = $invoicesStmt->fetchAll();
         foreach ($invoices as &$inv) {
             if (!empty($inv['items_json'])) {
                 $inv['items'] = json_decode($inv['items_json'], true) ?: [];
             }
         }
-        $expenses  = $pdo->query('SELECT * FROM expenses  ORDER BY date DESC LIMIT 500')->fetchAll();
-        $suppliers = $pdo->query('SELECT * FROM suppliers ORDER BY name')->fetchAll();
+
+        $expensesStmt = $pdo->prepare('SELECT * FROM expenses WHERE tenant_id = ? ORDER BY date DESC LIMIT 500');
+        $expensesStmt->execute([$tenantId]);
+        $expenses = $expensesStmt->fetchAll();
+
+        $suppliersStmt = $pdo->prepare('SELECT * FROM suppliers WHERE tenant_id = ? ORDER BY name');
+        $suppliersStmt->execute([$tenantId]);
+        $suppliers = $suppliersStmt->fetchAll();
+
         json_ok([
             'products'    => $products,
             'customers'   => $customers,
@@ -39,14 +55,18 @@ switch ($method) {
 
         $synced = 0;
         // ✅ تحويل PostgreSQL: ON DUPLICATE KEY UPDATE → ON CONFLICT DO UPDATE SET
+        // ✅ Multi-Tenant: tenant_id يُدرج في كل فاتورة، وشرط WHERE يحمي من كتابة
+        // فاتورة تابعة لمتجر آخر عند تطابق id بالخطأ (id يُفترض أن يكون فريدًا عالميًا
+        // لكن هذا حزام أمان إضافي كما في invoices.php)
         $stmt = $pdo->prepare(
             'INSERT INTO invoices
-             (id, customer_phone, user_email, date, subtotal, discount, tax, total, payment_method, status, items_json)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?)
+             (id, tenant_id, customer_phone, user_email, date, subtotal, discount, tax, total, payment_method, status, items_json)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
              ON CONFLICT (id) DO UPDATE SET
                 subtotal = EXCLUDED.subtotal, discount = EXCLUDED.discount,
                 tax = EXCLUDED.tax, total = EXCLUDED.total,
-                payment_method = EXCLUDED.payment_method, items_json = EXCLUDED.items_json'
+                payment_method = EXCLUDED.payment_method, items_json = EXCLUDED.items_json
+             WHERE invoices.tenant_id = EXCLUDED.tenant_id'
         );
         foreach ($invoices as $inv) {
             $id    = $inv['id'] ?? ('INV-' . time() . '-' . $synced);
@@ -54,6 +74,7 @@ switch ($method) {
             try {
                 $stmt->execute([
                     $id,
+                    $tenantId,
                     $inv['customer_phone'] ?? null,
                     $auth['email']          ?? $inv['user_email'] ?? null,
                     $inv['date']           ?? date('Y-m-d H:i:s'),
@@ -71,7 +92,7 @@ switch ($method) {
                 error_log('[Jawali][sync] Skipped invalid invoice #' . $id . ': ' . $e->getMessage());
             }
         }
-        audit("sync push: $synced invoice(s)", $auth['email'] ?? null);
+        audit("sync push: $synced invoice(s)", $auth['email'] ?? null, 'info', $tenantId);
         json_ok(['success' => true, 'synced' => $synced]);
         break;
     }

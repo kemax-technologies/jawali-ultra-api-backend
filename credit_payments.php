@@ -25,14 +25,15 @@ switch ($method) {
     // ─────────────────────────────────────────────────────────────────────────
     case 'GET': {
         // ✅ إصلاح #5: حماية GET بالمصادقة
-        require_auth();
+        $auth = require_auth();
+        $tenantId = tenant_id_from_auth($auth);
         if (!empty($_GET['id'])) {
-            $stmt = $pdo->prepare('SELECT * FROM credit_payments WHERE id = ? LIMIT 1');
-            $stmt->execute([$_GET['id']]);
+            $stmt = $pdo->prepare('SELECT * FROM credit_payments WHERE id = ? AND tenant_id = ? LIMIT 1');
+            $stmt->execute([$_GET['id'], $tenantId]);
             json_ok($stmt->fetch() ?: []);
         }
-        $sql  = 'SELECT * FROM credit_payments WHERE 1=1';
-        $args = [];
+        $sql  = 'SELECT * FROM credit_payments WHERE tenant_id = ?';
+        $args = [$tenantId];
         if (!empty($_GET['credit_id'])) {
             $sql .= ' AND credit_id = ?';
             $args[] = $_GET['credit_id'];
@@ -52,7 +53,8 @@ switch ($method) {
     // POST — تسجيل دفعة سداد + تحديث رصيد القيد تلقائياً
     // ─────────────────────────────────────────────────────────────────────────
     case 'POST': {
-        require_auth();
+        $auth = require_auth();
+        $tenantId = tenant_id_from_auth($auth);
         $body = input_json();
 
         $id        = $body['id']        ?? ('PM-' . round(microtime(true) * 1000));
@@ -68,8 +70,8 @@ switch ($method) {
         }
 
         // اجلب القيد الأساسي
-        $stmt = $pdo->prepare('SELECT * FROM credits WHERE id = ? LIMIT 1');
-        $stmt->execute([$creditId]);
+        $stmt = $pdo->prepare('SELECT * FROM credits WHERE id = ? AND tenant_id = ? LIMIT 1');
+        $stmt->execute([$creditId, $tenantId]);
         $credit = $stmt->fetch();
         if (!$credit) json_error('قيد الدَّين غير موجود', 404);
 
@@ -95,12 +97,12 @@ switch ($method) {
             // 1) أدرج الدفعة
             $ins = $pdo->prepare(
                 'INSERT INTO credit_payments
-                   (id, credit_id, customer_phone, amount_yer, amount_usd,
+                   (id, tenant_id, credit_id, customer_phone, amount_yer, amount_usd,
                     exchange_rate, currency, method, date, notes)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?)'
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?)'
             );
             $ins->execute([
-                $id, $creditId, $customerPhone,
+                $id, $tenantId, $creditId, $customerPhone,
                 $amountYer, $amountUsd, $rate,
                 $currency, $method_, $notes,
             ]);
@@ -121,9 +123,9 @@ switch ($method) {
 
             $upd = $pdo->prepare(
                 'UPDATE credits SET paid_yer = ?, paid_usd = ?, status = ?
-                 WHERE id = ?'
+                 WHERE id = ? AND tenant_id = ?'
             );
-            $upd->execute([$newPaidYer, $newPaidUsd, $newStatus, $creditId]);
+            $upd->execute([$newPaidYer, $newPaidUsd, $newStatus, $creditId, $tenantId]);
 
             $pdo->commit();
         } catch (Exception $e) {
@@ -132,7 +134,7 @@ switch ($method) {
             json_error('خطأ داخلي في الخادم', 500);
         }
 
-        audit("payment $id on credit $creditId amount=$amountYer YER ($currency)");
+        audit("payment $id on credit $creditId amount=$amountYer YER ($currency)", null, 'info', $tenantId);
         json_ok([
             'success'         => true,
             'id'              => $id,
@@ -149,28 +151,29 @@ switch ($method) {
     // DELETE — حذف دفعة (مدير فقط) + إعادة احتساب رصيد القيد
     // ─────────────────────────────────────────────────────────────────────────
     case 'DELETE': {
-        require_admin();
+        $auth = require_admin();
+        $tenantId = tenant_id_from_auth($auth);
         $id = $_GET['id'] ?? '';
         if ($id === '') json_error('id مطلوب');
 
         try {
             $pdo->beginTransaction();
             // اجلب الدفعة
-            $stmt = $pdo->prepare('SELECT * FROM credit_payments WHERE id = ? LIMIT 1');
-            $stmt->execute([$id]);
+            $stmt = $pdo->prepare('SELECT * FROM credit_payments WHERE id = ? AND tenant_id = ? LIMIT 1');
+            $stmt->execute([$id, $tenantId]);
             $pmt = $stmt->fetch();
             if (!$pmt) {
                 $pdo->rollBack();
                 json_error('الدفعة غير موجودة', 404);
             }
             // احذف الدفعة
-            $pdo->prepare('DELETE FROM credit_payments WHERE id = ?')->execute([$id]);
+            $pdo->prepare('DELETE FROM credit_payments WHERE id = ? AND tenant_id = ?')->execute([$id, $tenantId]);
             // أعد احتساب القيد
             $sum = $pdo->prepare(
                 'SELECT COALESCE(SUM(amount_yer),0) AS y, COALESCE(SUM(amount_usd),0) AS u
-                 FROM credit_payments WHERE credit_id = ?'
+                 FROM credit_payments WHERE credit_id = ? AND tenant_id = ?'
             );
-            $sum->execute([$pmt['credit_id']]);
+            $sum->execute([$pmt['credit_id'], $tenantId]);
             $row = $sum->fetch();
             $pdo->prepare(
                 'UPDATE credits SET paid_yer = ?, paid_usd = ?,
@@ -179,9 +182,9 @@ switch ($method) {
                      WHEN ? > 0 THEN \'مسدّد جزئياً\'
                      ELSE \'مفتوح\'
                    END
-                 WHERE id = ?'
+                 WHERE id = ? AND tenant_id = ?'
             )->execute([
-                $row['y'], $row['u'], $row['y'], $row['y'], $pmt['credit_id'],
+                $row['y'], $row['u'], $row['y'], $row['y'], $pmt['credit_id'], $tenantId,
             ]);
             $pdo->commit();
         } catch (Exception $e) {
@@ -190,7 +193,7 @@ switch ($method) {
             json_error('خطأ داخلي في الخادم', 500);
         }
 
-        audit("delete payment $id", null, 'warning');
+        audit("delete payment $id", null, 'warning', $tenantId);
         json_ok(['success' => true]);
         break;
     }

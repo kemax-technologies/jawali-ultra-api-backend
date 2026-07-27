@@ -7,17 +7,18 @@ $pdo    = db();
 switch ($method) {
     case 'GET': {
         // ✅ إصلاح #5: حماية GET بالمصادقة
-        require_auth();
+        $auth = require_auth();
+        $tenantId = tenant_id_from_auth($auth);
         $phone  = $_GET['phone']  ?? '';
         $tier   = $_GET['tier']   ?? '';
         $search = $_GET['search'] ?? '';
         if ($phone !== '') {
-            $stmt = $pdo->prepare('SELECT * FROM customers WHERE phone = ? LIMIT 1');
-            $stmt->execute([$phone]);
+            $stmt = $pdo->prepare('SELECT * FROM customers WHERE tenant_id = ? AND phone = ? LIMIT 1');
+            $stmt->execute([$tenantId, $phone]);
             json_ok($stmt->fetch() ?: []);
         }
-        $sql  = 'SELECT * FROM customers WHERE 1=1';
-        $args = [];
+        $sql  = 'SELECT * FROM customers WHERE tenant_id = ?';
+        $args = [$tenantId];
         if ($tier !== '')   { $sql .= ' AND tier = ?';                  $args[] = $tier; }
         // ✅ تحويل PostgreSQL: LIKE حساس لحالة الأحرف في Postgres (بخلاف MySQL
         //    الذي يكون غير حساس افتراضيًا) — استُخدم ILIKE لإبقاء سلوك البحث كما كان
@@ -31,7 +32,8 @@ switch ($method) {
     }
 
     case 'POST': {
-        require_auth();
+        $auth = require_auth();
+        $tenantId = tenant_id_from_auth($auth);
         $body  = input_json();
         $phone = trim($body['phone'] ?? '');
         $name  = trim($body['name']  ?? '');
@@ -41,10 +43,10 @@ switch ($method) {
         // 🆕 حقول القالب الموحّد: العنوان، حد الدين، الرصيد الافتتاحي (مدين/دائن)،
         // طريقة التواصل، الرقم الضريبي — لمطابقة النظام المرجعي
         $stmt = $pdo->prepare(
-            'INSERT INTO customers (phone, name, email, spent, visits, days_since_last, tier, notes,
+            'INSERT INTO customers (tenant_id, phone, name, email, spent, visits, days_since_last, tier, notes,
                 address, debt_limit, opening_balance, opening_is_debit, messaging_method, tax_id)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-             ON CONFLICT (phone) DO UPDATE SET
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             ON CONFLICT (tenant_id, phone) DO UPDATE SET
                 name = EXCLUDED.name, email = EXCLUDED.email,
                 spent = EXCLUDED.spent, visits = EXCLUDED.visits,
                 days_since_last = EXCLUDED.days_since_last,
@@ -56,7 +58,7 @@ switch ($method) {
                 tax_id = EXCLUDED.tax_id'
         );
         $stmt->execute([
-            $phone, $name,
+            $tenantId, $phone, $name,
             $body['email'] ?? null,
             (float)($body['spent']  ?? 0),
             (int)  ($body['visits'] ?? 0),
@@ -70,16 +72,17 @@ switch ($method) {
             $body['messagingMethod'] ?? $body['messaging_method'] ?? 'بدون',
             $body['taxId'] ?? $body['tax_id'] ?? null,
         ]);
-        audit("upsert customer $phone");
+        audit("upsert customer $phone", null, 'info', $tenantId);
         json_ok(['success' => true, 'phone' => $phone]);
         break;
     }
 
     case 'DELETE': {
-        require_auth();
+        $auth = require_auth();
+        $tenantId = tenant_id_from_auth($auth);
         $phone = $_GET['phone'] ?? '';
         if ($phone === '') json_error('phone مطلوب');
-        $pdo->prepare('DELETE FROM customers WHERE phone = ?')->execute([$phone]);
+        $pdo->prepare('DELETE FROM customers WHERE tenant_id = ? AND phone = ?')->execute([$tenantId, $phone]);
         json_ok(['success' => true]);
         break;
     }

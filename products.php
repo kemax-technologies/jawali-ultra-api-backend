@@ -12,7 +12,8 @@ function like_escape(string $s): string {
 switch ($method) {
     case 'GET': {
         // ✅ إصلاح #5: حماية GET بالمصادقة
-        require_auth();
+        $auth = require_auth();
+        $tenantId = tenant_id_from_auth($auth);
         $sku    = $_GET['sku']    ?? '';
         $search = $_GET['search'] ?? '';
         $barcode = $_GET['barcode'] ?? '';
@@ -26,17 +27,17 @@ switch ($method) {
                 "SELECT *,
                         CASE WHEN pack_barcode = ? THEN 'pack' ELSE 'piece' END AS matched_unit
                  FROM products
-                 WHERE barcode = ? OR pack_barcode = ?
+                 WHERE tenant_id = ? AND (barcode = ? OR pack_barcode = ?)
                  LIMIT 1"
             );
-            $stmt->execute([$barcode, $barcode, $barcode]);
+            $stmt->execute([$tenantId, $barcode, $barcode]);
             $row = $stmt->fetch();
             json_ok($row ?: []);
         }
 
         if ($sku !== '') {
-            $stmt = $pdo->prepare('SELECT * FROM products WHERE sku = ? LIMIT 1');
-            $stmt->execute([$sku]);
+            $stmt = $pdo->prepare('SELECT * FROM products WHERE tenant_id = ? AND sku = ? LIMIT 1');
+            $stmt->execute([$tenantId, $sku]);
             $row = $stmt->fetch();
             json_ok($row ?: []);
         }
@@ -47,21 +48,23 @@ switch ($method) {
             $like = '%' . like_escape($search) . '%';
             $stmt = $pdo->prepare(
                 "SELECT * FROM products
-                 WHERE name ILIKE ? OR sku ILIKE ? OR category ILIKE ?
+                 WHERE tenant_id = ? AND (name ILIKE ? OR sku ILIKE ? OR category ILIKE ?)
                  ORDER BY name LIMIT 200"
             );
-            $stmt->execute([$like, $like, $like]);
+            $stmt->execute([$tenantId, $like, $like, $like]);
             json_ok($stmt->fetchAll());
         }
-        $rows = $pdo->query(
-            'SELECT * FROM products ORDER BY name LIMIT 500'
-        )->fetchAll();
-        json_ok($rows);
+        $rows = $pdo->prepare(
+            'SELECT * FROM products WHERE tenant_id = ? ORDER BY name LIMIT 500'
+        );
+        $rows->execute([$tenantId]);
+        json_ok($rows->fetchAll());
         break;
     }
 
     case 'POST': {
-        require_auth();
+        $auth = require_auth();
+        $tenantId = tenant_id_from_auth($auth);
         $body = input_json();
         $sku  = trim($body['sku'] ?? '');
         $name = trim($body['name'] ?? '');
@@ -82,10 +85,10 @@ switch ($method) {
         // ✅ تحويل PostgreSQL: ON DUPLICATE KEY UPDATE → ON CONFLICT DO UPDATE SET
         $stmt = $pdo->prepare(
             'INSERT INTO products
-                (sku, name, category, price, cost, stock, sold, barcode, image_url,
+                (tenant_id, sku, name, category, price, cost, stock, sold, barcode, image_url,
                  base_unit, pack_unit, pack_factor, pack_price, pack_barcode, allow_pack_sale)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-             ON CONFLICT (sku) DO UPDATE SET
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             ON CONFLICT (tenant_id, sku) DO UPDATE SET
                 name            = EXCLUDED.name,
                 category        = EXCLUDED.category,
                 price           = EXCLUDED.price,
@@ -102,7 +105,7 @@ switch ($method) {
                 allow_pack_sale = EXCLUDED.allow_pack_sale'
         );
         $stmt->execute([
-            $sku, $name,
+            $tenantId, $sku, $name,
             $body['category']   ?? '',
             (float)($body['price']  ?? 0),
             (float)($body['cost']   ?? 0),
@@ -117,18 +120,19 @@ switch ($method) {
             $packBarcode,
             $allowPackSale,
         ]);
-        audit("upsert product $sku (units: $baseUnit / $packUnit x$packFactor)");
+        audit("upsert product $sku (units: $baseUnit / $packUnit x$packFactor)", null, 'info', $tenantId);
         json_ok(['success' => true, 'sku' => $sku]);
         break;
     }
 
     case 'DELETE': {
-        require_auth();
+        $auth = require_auth();
+        $tenantId = tenant_id_from_auth($auth);
         $sku = $_GET['sku'] ?? '';
         if ($sku === '') json_error('SKU مطلوب');
-        $stmt = $pdo->prepare('DELETE FROM products WHERE sku = ?');
-        $stmt->execute([$sku]);
-        audit("delete product $sku");
+        $stmt = $pdo->prepare('DELETE FROM products WHERE tenant_id = ? AND sku = ?');
+        $stmt->execute([$tenantId, $sku]);
+        audit("delete product $sku", null, 'info', $tenantId);
         json_ok(['success' => true]);
         break;
     }

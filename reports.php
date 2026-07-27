@@ -3,6 +3,7 @@ require_once __DIR__ . '/_db.php';
 
 // ✅ إصلاح #4: جميع التقارير تتطلب مصادقة
 $auth = require_auth();
+$tenantId = tenant_id_from_auth($auth);
 
 $pdo   = db();
 $type  = $_GET['type'] ?? '';
@@ -27,29 +28,41 @@ function date_filter(string $col, string $from, string $to): array {
 switch ($type) {
     // ── لوحة التحكم ──────────────────────────────────────────────────────────
     case 'dashboard': {
-        $totals = $pdo->query(
+        $totalsStmt = $pdo->prepare(
             'SELECT
                 COALESCE(SUM(total),0)    AS total_sales,
                 COALESCE(COUNT(*),0)      AS total_invoices,
                 COALESCE(SUM(discount),0) AS total_discounts,
                 COALESCE(SUM(tax),0)      AS total_taxes
-             FROM invoices'
-        )->fetch();
-        $today = $pdo->query(
+             FROM invoices WHERE tenant_id = ?'
+        );
+        $totalsStmt->execute([$tenantId]);
+        $totals = $totalsStmt->fetch();
+
+        $todayStmt = $pdo->prepare(
             // ✅ تحويل PostgreSQL: CURDATE() (MySQL) → CURRENT_DATE
             "SELECT COALESCE(SUM(total),0) AS today_sales, COUNT(*) AS today_invoices
-             FROM invoices WHERE DATE(date) = CURRENT_DATE"
-        )->fetch();
-        $stocks = $pdo->query(
+             FROM invoices WHERE DATE(date) = CURRENT_DATE AND tenant_id = ?"
+        );
+        $todayStmt->execute([$tenantId]);
+        $today = $todayStmt->fetch();
+
+        $stocksStmt = $pdo->prepare(
             'SELECT COUNT(*) AS total_products,
                     SUM(CASE WHEN stock <= 5 THEN 1 ELSE 0 END) AS low_stock,
                     SUM(CASE WHEN stock = 0  THEN 1 ELSE 0 END) AS out_of_stock,
                     COALESCE(SUM(price*stock), 0) AS inventory_value
-             FROM products'
-        )->fetch();
-        $expenses = $pdo->query(
-            'SELECT COALESCE(SUM(value),0) AS total FROM expenses'
-        )->fetch();
+             FROM products WHERE tenant_id = ?'
+        );
+        $stocksStmt->execute([$tenantId]);
+        $stocks = $stocksStmt->fetch();
+
+        $expensesStmt = $pdo->prepare(
+            'SELECT COALESCE(SUM(value),0) AS total FROM expenses WHERE tenant_id = ?'
+        );
+        $expensesStmt->execute([$tenantId]);
+        $expenses = $expensesStmt->fetch();
+
         json_ok([
             'totals'   => $totals,
             'today'    => $today,
@@ -68,10 +81,10 @@ switch ($type) {
                     COALESCE(SUM(total),0)    AS revenue,
                     COALESCE(SUM(discount),0) AS discounts,
                     COALESCE(SUM(tax),0)      AS taxes
-             FROM invoices WHERE 1=1 $where
+             FROM invoices WHERE tenant_id = ? $where
              GROUP BY DATE(date) ORDER BY day DESC LIMIT $limit"
         );
-        $stmt->execute($args);
+        $stmt->execute(array_merge([$tenantId], $args));
         $rows = $stmt->fetchAll();
 
         $sumStmt = $pdo->prepare(
@@ -79,9 +92,9 @@ switch ($type) {
                     COALESCE(SUM(total),0)    AS total_revenue,
                     COALESCE(SUM(discount),0) AS total_discounts,
                     COALESCE(SUM(tax),0)      AS total_taxes
-             FROM invoices WHERE 1=1 $where"
+             FROM invoices WHERE tenant_id = ? $where"
         );
-        $sumStmt->execute($args);
+        $sumStmt->execute(array_merge([$tenantId], $args));
         json_ok(['rows' => $rows, 'totals' => $sumStmt->fetch(), 'from' => $from, 'to' => $to]);
         break;
     }
@@ -89,12 +102,12 @@ switch ($type) {
     // ── تقرير الربحية ────────────────────────────────────────────────────────
     case 'profit': {
         [$where, $args] = date_filter('date', $from, $to);
-        $rev = $pdo->prepare("SELECT COALESCE(SUM(total),0) AS v FROM invoices WHERE 1=1 $where");
-        $rev->execute($args);
+        $rev = $pdo->prepare("SELECT COALESCE(SUM(total),0) AS v FROM invoices WHERE tenant_id = ? $where");
+        $rev->execute(array_merge([$tenantId], $args));
         $revenue = (float)($rev->fetch()['v'] ?? 0);
 
-        $exp = $pdo->prepare("SELECT COALESCE(SUM(value),0) AS v FROM expenses WHERE 1=1 $where");
-        $exp->execute($args);
+        $exp = $pdo->prepare("SELECT COALESCE(SUM(value),0) AS v FROM expenses WHERE tenant_id = ? $where");
+        $exp->execute(array_merge([$tenantId], $args));
         $expenses = (float)($exp->fetch()['v'] ?? 0);
 
         $profit = $revenue - $expenses;
@@ -112,19 +125,23 @@ switch ($type) {
 
     // ── أعلى المنتجات ────────────────────────────────────────────────────────
     case 'top_products': {
-        $rows = $pdo->query(
+        $stmt = $pdo->prepare(
             'SELECT sku, name, sold, price, (price*sold) AS revenue
-             FROM products ORDER BY sold DESC LIMIT 20'
-        )->fetchAll();
+             FROM products WHERE tenant_id = ? ORDER BY sold DESC LIMIT 20'
+        );
+        $stmt->execute([$tenantId]);
+        $rows = $stmt->fetchAll();
         json_ok($rows);
         break;
     }
 
     // ── تقرير المخزون ────────────────────────────────────────────────────────
     case 'inventory': {
-        $rows = $pdo->query(
-            'SELECT * FROM products ORDER BY stock ASC LIMIT 500'
-        )->fetchAll();
+        $stmt = $pdo->prepare(
+            'SELECT * FROM products WHERE tenant_id = ? ORDER BY stock ASC LIMIT 500'
+        );
+        $stmt->execute([$tenantId]);
+        $rows = $stmt->fetchAll();
         json_ok($rows);
         break;
     }
@@ -132,17 +149,23 @@ switch ($type) {
     // ── تحليلات ──────────────────────────────────────────────────────────────
     case 'analytics': {
         // ✅ تحويل PostgreSQL: "" (علامتان مزدوجتان) هي identifier فاضي في Postgres، لا سلسلة نصية — استُخدمت علامة مفردة ''
-        $byCategory = $pdo->query(
+        $byCategoryStmt = $pdo->prepare(
             'SELECT category, COUNT(*) AS count,
                     COALESCE(SUM(sold),0) AS units_sold,
                     COALESCE(SUM(price*sold),0) AS revenue
-             FROM products WHERE category IS NOT NULL AND category <> \'\'
+             FROM products WHERE category IS NOT NULL AND category <> \'\' AND tenant_id = ?
              GROUP BY category ORDER BY revenue DESC'
-        )->fetchAll();
-        $byPayment = $pdo->query(
+        );
+        $byCategoryStmt->execute([$tenantId]);
+        $byCategory = $byCategoryStmt->fetchAll();
+
+        $byPaymentStmt = $pdo->prepare(
             'SELECT payment_method, COUNT(*) AS count, COALESCE(SUM(total),0) AS total
-             FROM invoices GROUP BY payment_method'
-        )->fetchAll();
+             FROM invoices WHERE tenant_id = ? GROUP BY payment_method'
+        );
+        $byPaymentStmt->execute([$tenantId]);
+        $byPayment = $byPaymentStmt->fetchAll();
+
         json_ok(['categories' => $byCategory, 'payments' => $byPayment]);
         break;
     }
@@ -154,9 +177,9 @@ switch ($type) {
             json_error('غير مصرح — يتطلب صلاحية مدير', 403);
         }
         $stmt = $pdo->prepare(
-            'SELECT * FROM audit_log ORDER BY id DESC LIMIT ' . $limit
+            'SELECT * FROM audit_log WHERE tenant_id = ? ORDER BY id DESC LIMIT ' . $limit
         );
-        $stmt->execute();
+        $stmt->execute([$tenantId]);
         json_ok($stmt->fetchAll());
         break;
     }

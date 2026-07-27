@@ -62,6 +62,7 @@ switch ($action) {
     case 'request': {
         if ($method !== 'POST') json_error('استخدم POST', 405);
         $auth = require_auth();
+        $tenantId = tenant_id_from_auth($auth);
         $userId = (int)$auth['sub'];
         $email  = (string)$auth['email'];
 
@@ -104,15 +105,15 @@ switch ($action) {
         $ins = $pdo->prepare(
             'INSERT INTO pro_requests
                 (user_id, user_email, plan, amount, currency, bank_account,
-                 transfer_reference, sender_name, notes, status)
-             VALUES (?,?,?,?,?,?,?,?,?, \'pending\')'
+                 transfer_reference, sender_name, notes, status, tenant_id)
+             VALUES (?,?,?,?,?,?,?,?,?, \'pending\', ?)'
         );
         $ins->execute([
             $userId, $email, $plan, $amount, $currency, $bankAccount,
-            $reference, $senderName, $notes,
+            $reference, $senderName, $notes, $tenantId,
         ]);
 
-        audit('طلب ترقية Pro جديد', $email);
+        audit('طلب ترقية Pro جديد', $email, 'info', $tenantId);
         json_ok([
             'success' => true,
             'message' => 'تم استلام طلبك وسيتم تفعيل حسابك بعد مراجعة التحويل',
@@ -126,15 +127,16 @@ switch ($action) {
     // ═════════════════════════════════════════════════════════════════════════
     case 'status': {
         $auth = require_auth();
+        $tenantId = tenant_id_from_auth($auth);
         $userId = (int)$auth['sub'];
 
         $status = pro_autoexpire($pdo, $userId);
 
         $stmt = $pdo->prepare(
             'SELECT id, plan, status, transfer_reference, reject_reason, created_at, reviewed_at
-             FROM pro_requests WHERE user_id = ? ORDER BY id DESC LIMIT 1'
+             FROM pro_requests WHERE user_id = ? AND tenant_id = ? ORDER BY id DESC LIMIT 1'
         );
-        $stmt->execute([$userId]);
+        $stmt->execute([$userId, $tenantId]);
         $lastRequest = $stmt->fetch() ?: null;
 
         json_ok([
@@ -151,21 +153,23 @@ switch ($action) {
     // GET — قائمة كل الطلبات (لوحة تحكم المدير)
     // ═════════════════════════════════════════════════════════════════════════
     case 'list': {
-        require_admin();
+        $admin = require_admin();
+        $tenantId = tenant_id_from_auth($admin);
         $statusFilter = $_GET['status'] ?? '';
         if ($statusFilter !== '' && in_array($statusFilter, ['pending', 'approved', 'rejected'], true)) {
             $stmt = $pdo->prepare(
                 'SELECT pr.*, u.name AS user_name
                  FROM pro_requests pr JOIN users u ON u.id = pr.user_id
-                 WHERE pr.status = ? ORDER BY pr.id DESC'
+                 WHERE pr.status = ? AND pr.tenant_id = ? ORDER BY pr.id DESC'
             );
-            $stmt->execute([$statusFilter]);
+            $stmt->execute([$statusFilter, $tenantId]);
         } else {
-            $stmt = $pdo->query(
+            $stmt = $pdo->prepare(
                 'SELECT pr.*, u.name AS user_name
                  FROM pro_requests pr JOIN users u ON u.id = pr.user_id
-                 ORDER BY pr.id DESC LIMIT 200'
+                 WHERE pr.tenant_id = ? ORDER BY pr.id DESC LIMIT 200'
             );
+            $stmt->execute([$tenantId]);
         }
         json_ok(['success' => true, 'requests' => $stmt->fetchAll()]);
         break;
@@ -177,17 +181,20 @@ switch ($action) {
     case 'approve': {
         if ($method !== 'POST') json_error('استخدم POST', 405);
         $admin = require_admin();
+        $tenantId = tenant_id_from_auth($admin);
         $body = input_json();
         $requestId = (int)($body['request_id'] ?? 0);
         if ($requestId <= 0) json_error('request_id مطلوب');
 
         // ✅ تحسين: منطق الموافقة موحّد الآن في _pro_helpers.php ويُستخدم من
         //    pro.php و dev_pro.php لمنع انحراف التنفيذ بين لوحتي التحكم.
-        $result = pro_approve_request($pdo, $requestId, $admin['email'] ?? '');
+        // ✅ Multi-Tenant: تمرير $tenantId يقيّد الموافقة بطلبات متجر المدير
+        //    الحالي فقط — لا يمكن لمدير متجر الموافقة على طلب متجر آخر.
+        $result = pro_approve_request($pdo, $requestId, $admin['email'] ?? '', $tenantId);
         $req = $result['request'];
         $expiresAt = $result['expires_at'];
 
-        audit("تفعيل Pro للمستخدم {$req['user_email']} (خطة {$req['plan']})", $admin['email'] ?? null);
+        audit("تفعيل Pro للمستخدم {$req['user_email']} (خطة {$req['plan']})", $admin['email'] ?? null, 'info', $tenantId);
         json_ok(['success' => true, 'message' => 'تم تفعيل الحساب Pro بنجاح', 'expires_at' => $expiresAt]);
         break;
     }
@@ -198,14 +205,15 @@ switch ($action) {
     case 'reject': {
         if ($method !== 'POST') json_error('استخدم POST', 405);
         $admin = require_admin();
+        $tenantId = tenant_id_from_auth($admin);
         $body = input_json();
         $requestId = (int)($body['request_id'] ?? 0);
         $reason = trim((string)($body['reason'] ?? 'لم يتم تأكيد التحويل'));
         if ($requestId <= 0) json_error('request_id مطلوب');
 
-        $req = pro_reject_request($pdo, $requestId, $admin['email'] ?? '', $reason);
+        $req = pro_reject_request($pdo, $requestId, $admin['email'] ?? '', $reason, $tenantId);
 
-        audit("رفض طلب ترقية Pro للمستخدم {$req['user_email']}", $admin['email'] ?? null);
+        audit("رفض طلب ترقية Pro للمستخدم {$req['user_email']}", $admin['email'] ?? null, 'info', $tenantId);
         json_ok(['success' => true, 'message' => 'تم رفض الطلب']);
         break;
     }
@@ -216,14 +224,19 @@ switch ($action) {
     case 'revoke': {
         if ($method !== 'POST') json_error('استخدم POST', 405);
         $admin = require_admin();
+        $tenantId = tenant_id_from_auth($admin);
         $body = input_json();
         $email = strtolower(trim((string)($body['email'] ?? '')));
         if ($email === '') json_error('email مطلوب');
 
-        $stmt = $pdo->prepare('UPDATE users SET is_pro = 0 WHERE email = ?');
-        $stmt->execute([$email]);
+        // ✅ Multi-Tenant: مدير متجر لا يمكنه إلغاء تفعيل Pro لمستخدم في متجر آخر.
+        $stmt = $pdo->prepare('UPDATE users SET is_pro = 0 WHERE email = ? AND tenant_id = ?');
+        $stmt->execute([$email, $tenantId]);
+        if ($stmt->rowCount() === 0) {
+            json_error('المستخدم غير موجود في متجرك', 404);
+        }
 
-        audit("إلغاء تفعيل Pro للمستخدم $email", $admin['email'] ?? null);
+        audit("إلغاء تفعيل Pro للمستخدم $email", $admin['email'] ?? null, 'info', $tenantId);
         json_ok(['success' => true, 'message' => 'تم إلغاء التفعيل']);
         break;
     }

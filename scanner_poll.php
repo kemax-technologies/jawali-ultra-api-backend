@@ -38,7 +38,7 @@ if ($sessionId === '') json_error('session_id مطلوب', 400);
 // ── جلب حالة الجلسة بأعمدة محددة فقط (لا SELECT *) ─────────────────────────
 try {
     $stmt = db()->prepare(
-        'SELECT id, status, last_code_id, scan_count, expires_at
+        'SELECT id, status, last_code_id, scan_count, expires_at, tenant_id
          FROM scanner_sessions
          WHERE id = ?
          LIMIT 1'
@@ -53,6 +53,9 @@ try {
 if (!$row) {
     json_error('الجلسة غير موجودة', 404);
 }
+
+// ── tenant_id مأخوذ من الجلسة نفسها (لا يوجد JWT في هذا الـ endpoint) ────────
+$tenantId = $row['tenant_id'] ?? null;
 
 // ── التحقق من الانتهاء ────────────────────────────────────────────────────────
 $expiresTs = strtotime($row['expires_at']);
@@ -80,31 +83,31 @@ try {
         $stmtQ = db()->prepare(
             'SELECT id, code, received_at
              FROM scanner_codes
-             WHERE session_id = ? AND id > ?
+             WHERE session_id = ? AND id > ? AND tenant_id = ?
              ORDER BY id ASC
              LIMIT 20'
         );
-        $stmtQ->execute([$sessionId, $lastId]);
+        $stmtQ->execute([$sessionId, $lastId, $tenantId]);
     } elseif ($after !== '') {
         // ✅ التوافق مع الإصدارات السابقة: استخدام after (timestamp)
         $stmtQ = db()->prepare(
             'SELECT id, code, received_at
              FROM scanner_codes
-             WHERE session_id = ? AND received_at > ?
+             WHERE session_id = ? AND received_at > ? AND tenant_id = ?
              ORDER BY id ASC
              LIMIT 20'
         );
-        $stmtQ->execute([$sessionId, $after]);
+        $stmtQ->execute([$sessionId, $after, $tenantId]);
     } else {
         // أول استعلام بدون مؤشر — جلب آخر باركود فقط للتوافق
         $stmtQ = db()->prepare(
             'SELECT id, code, received_at
              FROM scanner_codes
-             WHERE session_id = ?
+             WHERE session_id = ? AND tenant_id = ?
              ORDER BY id DESC
              LIMIT 1'
         );
-        $stmtQ->execute([$sessionId]);
+        $stmtQ->execute([$sessionId, $tenantId]);
     }
 
     $rows = $stmtQ->fetchAll();

@@ -26,12 +26,13 @@ switch ($method) {
     // GET
     // ─────────────────────────────────────────────────────────────────────────
     case 'GET': {
-        require_auth();
+        $auth = require_auth();
+        $tenantId = tenant_id_from_auth($auth);
 
         // كل الحركات (تحويلات/إيداعات/سحوبات)
         if (isset($_GET['transactions'])) {
-            $sql  = 'SELECT * FROM cash_transactions WHERE 1=1';
-            $args = [];
+            $sql  = 'SELECT * FROM cash_transactions WHERE tenant_id = ?';
+            $args = [$tenantId];
             if (!empty($_GET['account_id'])) {
                 $sql .= ' AND account_id = ?';
                 $args[] = $_GET['account_id'];
@@ -44,22 +45,23 @@ switch ($method) {
 
         // حساب محدد + آخر حركاته
         if (!empty($_GET['id'])) {
-            $stmt = $pdo->prepare('SELECT * FROM cash_accounts WHERE id = ? LIMIT 1');
-            $stmt->execute([$_GET['id']]);
+            $stmt = $pdo->prepare('SELECT * FROM cash_accounts WHERE id = ? AND tenant_id = ? LIMIT 1');
+            $stmt->execute([$_GET['id'], $tenantId]);
             $acc = $stmt->fetch();
             if (!$acc) json_error('الحساب غير موجود', 404);
             $tx = $pdo->prepare(
-                'SELECT * FROM cash_transactions WHERE account_id = ? ORDER BY created_at DESC LIMIT 100'
+                'SELECT * FROM cash_transactions WHERE account_id = ? AND tenant_id = ? ORDER BY created_at DESC LIMIT 100'
             );
-            $tx->execute([$_GET['id']]);
+            $tx->execute([$_GET['id'], $tenantId]);
             $acc['transactions'] = $tx->fetchAll();
             json_ok($acc);
         }
 
         // قائمة كل الحسابات
-        $stmt = $pdo->query(
-            "SELECT * FROM cash_accounts WHERE is_active = TRUE ORDER BY created_at ASC"
+        $stmt = $pdo->prepare(
+            "SELECT * FROM cash_accounts WHERE is_active = TRUE AND tenant_id = ? ORDER BY created_at ASC"
         );
+        $stmt->execute([$tenantId]);
         json_ok($stmt->fetchAll());
         break;
     }
@@ -68,7 +70,8 @@ switch ($method) {
     // POST — إنشاء/تحديث حساب، أو تحويل/إيداع
     // ─────────────────────────────────────────────────────────────────────────
     case 'POST': {
-        require_auth();
+        $auth = require_auth();
+        $tenantId = tenant_id_from_auth($auth);
         $action = $_GET['action'] ?? '';
         $body   = input_json();
 
@@ -83,42 +86,42 @@ switch ($method) {
             }
             if ($fromId === $toId) json_error('لا يمكن التحويل لنفس الحساب');
 
-            $fromStmt = $pdo->prepare('SELECT * FROM cash_accounts WHERE id = ? LIMIT 1');
-            $fromStmt->execute([$fromId]);
+            $fromStmt = $pdo->prepare('SELECT * FROM cash_accounts WHERE id = ? AND tenant_id = ? LIMIT 1');
+            $fromStmt->execute([$fromId, $tenantId]);
             $from = $fromStmt->fetch();
             if (!$from) json_error('الحساب المصدر غير موجود', 404);
             if ((float)$from['balance'] < $amount) {
                 json_error('الرصيد غير كافٍ في الحساب المصدر');
             }
 
-            $toStmt = $pdo->prepare('SELECT * FROM cash_accounts WHERE id = ? LIMIT 1');
-            $toStmt->execute([$toId]);
+            $toStmt = $pdo->prepare('SELECT * FROM cash_accounts WHERE id = ? AND tenant_id = ? LIMIT 1');
+            $toStmt->execute([$toId, $tenantId]);
             $to = $toStmt->fetch();
             if (!$to) json_error('الحساب الهدف غير موجود', 404);
 
             $pdo->beginTransaction();
             try {
-                $pdo->prepare('UPDATE cash_accounts SET balance = balance - ? WHERE id = ?')
-                    ->execute([$amount, $fromId]);
-                $pdo->prepare('UPDATE cash_accounts SET balance = balance + ? WHERE id = ?')
-                    ->execute([$amount, $toId]);
+                $pdo->prepare('UPDATE cash_accounts SET balance = balance - ? WHERE id = ? AND tenant_id = ?')
+                    ->execute([$amount, $fromId, $tenantId]);
+                $pdo->prepare('UPDATE cash_accounts SET balance = balance + ? WHERE id = ? AND tenant_id = ?')
+                    ->execute([$amount, $toId, $tenantId]);
 
                 $txOutId = 'TX-' . round(microtime(true) * 1000) . '-OUT';
                 $pdo->prepare(
-                    'INSERT INTO cash_transactions (id, account_id, type, amount, currency, related_account_id, notes, created_by)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+                    'INSERT INTO cash_transactions (id, account_id, type, amount, currency, related_account_id, notes, created_by, tenant_id)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
                 )->execute([
                     $txOutId, $fromId, 'تحويل صادر', $amount, $from['currency'], $toId, $notes,
-                    $_SERVER['HTTP_X_USER_EMAIL'] ?? null,
+                    $_SERVER['HTTP_X_USER_EMAIL'] ?? null, $tenantId,
                 ]);
 
                 $txInId = 'TX-' . round(microtime(true) * 1000) . '-IN';
                 $pdo->prepare(
-                    'INSERT INTO cash_transactions (id, account_id, type, amount, currency, related_account_id, notes, created_by)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+                    'INSERT INTO cash_transactions (id, account_id, type, amount, currency, related_account_id, notes, created_by, tenant_id)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
                 )->execute([
                     $txInId, $toId, 'تحويل وارد', $amount, $to['currency'], $fromId, $notes,
-                    $_SERVER['HTTP_X_USER_EMAIL'] ?? null,
+                    $_SERVER['HTTP_X_USER_EMAIL'] ?? null, $tenantId,
                 ]);
 
                 $pdo->commit();
@@ -128,7 +131,7 @@ switch ($method) {
                 json_error('فشل تنفيذ التحويل', 500);
             }
 
-            audit("cash transfer $fromId -> $toId amount=$amount");
+            audit("cash transfer $fromId -> $toId amount=$amount", null, 'info', $tenantId);
             json_ok(['success' => true, 'from_id' => $fromId, 'to_id' => $toId]);
             break;
         }
@@ -141,8 +144,8 @@ switch ($method) {
             $notes = $body['notes'] ?? '';
             if ($accId === '' || $amount <= 0) json_error('account_id و amount مطلوبة');
 
-            $accStmt = $pdo->prepare('SELECT * FROM cash_accounts WHERE id = ? LIMIT 1');
-            $accStmt->execute([$accId]);
+            $accStmt = $pdo->prepare('SELECT * FROM cash_accounts WHERE id = ? AND tenant_id = ? LIMIT 1');
+            $accStmt->execute([$accId, $tenantId]);
             $acc = $accStmt->fetch();
             if (!$acc) json_error('الحساب غير موجود', 404);
 
@@ -151,19 +154,19 @@ switch ($method) {
                 json_error('الرصيد غير كافٍ');
             }
 
-            $pdo->prepare('UPDATE cash_accounts SET balance = balance + ? WHERE id = ?')
-                ->execute([$delta, $accId]);
+            $pdo->prepare('UPDATE cash_accounts SET balance = balance + ? WHERE id = ? AND tenant_id = ?')
+                ->execute([$delta, $accId, $tenantId]);
 
             $txId = 'TX-' . round(microtime(true) * 1000);
             $pdo->prepare(
-                'INSERT INTO cash_transactions (id, account_id, type, amount, currency, notes, created_by)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)'
+                'INSERT INTO cash_transactions (id, account_id, type, amount, currency, notes, created_by, tenant_id)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
             )->execute([
                 $txId, $accId, $type, $amount, $acc['currency'], $notes,
-                $_SERVER['HTTP_X_USER_EMAIL'] ?? null,
+                $_SERVER['HTTP_X_USER_EMAIL'] ?? null, $tenantId,
             ]);
 
-            audit("cash $type on $accId amount=$amount");
+            audit("cash $type on $accId amount=$amount", null, 'info', $tenantId);
             json_ok(['success' => true, 'id' => $txId]);
             break;
         }
@@ -184,19 +187,20 @@ switch ($method) {
 
         if ($isNew) {
             $stmt = $pdo->prepare(
-                'INSERT INTO cash_accounts (id, name, type, currency, balance, account_number, bank_name, notes)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+                'INSERT INTO cash_accounts (id, name, type, currency, balance, account_number, bank_name, notes, tenant_id)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
             );
-            $stmt->execute([$id, $name, $type, $currency, $balance, $accountNumber, $bankName, $notes]);
-            audit("create cash account $id ($name)");
+            $stmt->execute([$id, $name, $type, $currency, $balance, $accountNumber, $bankName, $notes, $tenantId]);
+            audit("create cash account $id ($name)", null, 'info', $tenantId);
         } else {
             $stmt = $pdo->prepare(
                 'UPDATE cash_accounts SET
                     name = ?, type = ?, currency = ?, account_number = ?, bank_name = ?, notes = ?
-                 WHERE id = ?'
+                 WHERE id = ? AND tenant_id = ?'
             );
-            $stmt->execute([$name, $type, $currency, $accountNumber, $bankName, $notes, $id]);
-            audit("update cash account $id ($name)");
+            $stmt->execute([$name, $type, $currency, $accountNumber, $bankName, $notes, $id, $tenantId]);
+            if ($stmt->rowCount() === 0) json_error('الحساب غير موجود في متجرك', 404);
+            audit("update cash account $id ($name)", null, 'info', $tenantId);
         }
         json_ok(['success' => true, 'id' => $id]);
         break;
@@ -206,11 +210,14 @@ switch ($method) {
     // DELETE — حذف حساب (للمدير فقط)
     // ─────────────────────────────────────────────────────────────────────────
     case 'DELETE': {
-        require_admin();
+        $auth = require_admin();
+        $tenantId = tenant_id_from_auth($auth);
         $id = $_GET['id'] ?? '';
         if ($id === '') json_error('id مطلوب');
-        $pdo->prepare('UPDATE cash_accounts SET is_active = FALSE WHERE id = ?')->execute([$id]);
-        audit("deactivate cash account $id", null, 'warning');
+        $upd = $pdo->prepare('UPDATE cash_accounts SET is_active = FALSE WHERE id = ? AND tenant_id = ?');
+        $upd->execute([$id, $tenantId]);
+        if ($upd->rowCount() === 0) json_error('الحساب غير موجود في متجرك', 404);
+        audit("deactivate cash account $id", null, 'warning', $tenantId);
         json_ok(['success' => true]);
         break;
     }

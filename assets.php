@@ -17,16 +17,19 @@ $pdo    = db();
 
 switch ($method) {
     case 'GET': {
-        require_auth();
-        $stmt = $pdo->query(
-            'SELECT * FROM assets WHERE is_active = TRUE ORDER BY created_at DESC'
+        $auth = require_auth();
+        $tenantId = tenant_id_from_auth($auth);
+        $stmt = $pdo->prepare(
+            'SELECT * FROM assets WHERE is_active = TRUE AND tenant_id = ? ORDER BY created_at DESC'
         );
+        $stmt->execute([$tenantId]);
         json_ok($stmt->fetchAll());
         break;
     }
 
     case 'POST': {
-        require_auth();
+        $auth = require_auth();
+        $tenantId = tenant_id_from_auth($auth);
         $b = input_json();
 
         $id = trim($b['id'] ?? '');
@@ -49,38 +52,46 @@ switch ($method) {
             $stmt = $pdo->prepare(
                 'INSERT INTO assets
                     (id, name, category, purchase_date, purchase_value, current_value,
-                     depreciation_rate, location, serial_number, status, notes)
-                 VALUES (?,?,?,?,?,?,?,?,?,?,?)'
+                     depreciation_rate, location, serial_number, status, notes, tenant_id)
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)'
             );
             $stmt->execute([
                 $id, $name, $category, $purchaseDate, $purchaseValue, $currentValue,
-                $depreciationRate, $location, $serialNumber, $status, $notes,
+                $depreciationRate, $location, $serialNumber, $status, $notes, $tenantId,
             ]);
-            audit("create asset $id ($name)");
+            audit("create asset $id ($name)", null, 'info', $tenantId);
         } else {
             $stmt = $pdo->prepare(
                 'UPDATE assets SET
                     name = ?, category = ?, purchase_date = ?, purchase_value = ?,
                     current_value = ?, depreciation_rate = ?, location = ?,
                     serial_number = ?, status = ?, notes = ?
-                 WHERE id = ?'
+                 WHERE id = ? AND tenant_id = ?'
             );
             $stmt->execute([
                 $name, $category, $purchaseDate, $purchaseValue, $currentValue,
-                $depreciationRate, $location, $serialNumber, $status, $notes, $id,
+                $depreciationRate, $location, $serialNumber, $status, $notes, $id, $tenantId,
             ]);
-            audit("update asset $id ($name)");
+            if ($stmt->rowCount() === 0) {
+                json_error('الأصل غير موجود في متجرك', 404);
+            }
+            audit("update asset $id ($name)", null, 'info', $tenantId);
         }
         json_ok(['success' => true, 'id' => $id]);
         break;
     }
 
     case 'DELETE': {
-        require_auth();
+        $auth = require_auth();
+        $tenantId = tenant_id_from_auth($auth);
         $id = $_GET['id'] ?? '';
         if ($id === '') json_error('id مطلوب');
-        $pdo->prepare('UPDATE assets SET is_active = FALSE WHERE id = ?')->execute([$id]);
-        audit("deactivate asset $id", null, 'warning');
+        $stmt = $pdo->prepare('UPDATE assets SET is_active = FALSE WHERE id = ? AND tenant_id = ?');
+        $stmt->execute([$id, $tenantId]);
+        if ($stmt->rowCount() === 0) {
+            json_error('الأصل غير موجود في متجرك', 404);
+        }
+        audit("deactivate asset $id", null, 'warning', $tenantId);
         json_ok(['success' => true]);
         break;
     }

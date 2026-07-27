@@ -30,7 +30,7 @@ switch ($action) {
         rl_check('login', $email . '|' . $ip, 5, 900);
 
         $stmt = db()->prepare(
-            'SELECT id, name, email, password_hash, role, is_active, permissions FROM users WHERE email = ? LIMIT 1'
+            'SELECT id, name, email, password_hash, role, is_active, permissions, tenant_id FROM users WHERE email = ? LIMIT 1'
         );
         $stmt->execute([$email]);
         $user = $stmt->fetch();
@@ -65,9 +65,10 @@ switch ($action) {
         log_user_session($email, (string)($user['role'] ?? ''), $token);
         audit('تسجيل دخول (' . ($user['role'] ?? '') . ')', $email);
 
-        // ✅ إبقاء تسجيل admin_sessions القديم للمدير/المالك فقط (توافقية خلفية
-        // مع لوحة الأدمن الويب التي لا تزال تقرأ من هذا الجدول تحديداً)
-        if (($user['role'] ?? '') === 'مدير' || ($user['role'] ?? '') === 'المالك') {
+        // ✅ إبقاء تسجيل admin_sessions القديم لدور "مدير" فقط (توافقية خلفية
+        // مع لوحة الأدمن الويب التي لا تزال تقرأ من هذا الجدول تحديداً) — دور
+        // "المالك" لم يعد موجوداً في النظام؛ صاحب المنصة يُدار من لوحة المطوّر فقط.
+        if (($user['role'] ?? '') === 'مدير') {
             try {
                 db()->prepare(
                     'INSERT INTO admin_sessions (user_email, token_hash, ip_address, user_agent, expires_at)
@@ -92,6 +93,8 @@ switch ($action) {
                 'email'       => $user['email'],
                 'role'        => $user['role'],
                 'permissions' => $permissions,
+                // ✅ Multi-Tenant: يُفيد الواجهة (Flutter) في عرض سياق "متجرك"
+                'tenant_id'   => isset($user['tenant_id']) ? (int)$user['tenant_id'] : null,
             ],
         ]);
         break;
@@ -102,9 +105,14 @@ switch ($action) {
         $name  = trim($body['name']  ?? '');
         $email = strtolower(trim($body['email'] ?? ''));
         $pass  = (string)($body['password'] ?? '');
-        // ✅ إصلاح #2: الدور الافتراضي ثابت دائماً — لا يُقبل role من المستخدم
-        // إنشاء حسابات المدراء يتم فقط من لوحة الإدارة أو Seeder داخلي
-        $role = 'كاشير';
+        $storeName = trim($body['store_name'] ?? '');
+        if ($storeName === '') $storeName = 'متجر ' . ($name !== '' ? $name : $email);
+
+        // ✅ Multi-Tenant: التطبيق يُنشر للعامة على متجر بلاي — كل من يسجّل حساباً
+        // جديداً بنفسه يصبح تلقائياً صاحب متجر ("مدير") مستقل وخاص به بالكامل،
+        // معزول تماماً عن بيانات كل المتاجر الأخرى. لا يوجد "كاشير" افتراضي هنا؛
+        // صاحب المتجر نفسه هو من يُنشئ حسابات الكاشير/الموظفين من لوحة إدارة متجره.
+        $role = 'مدير';
 
         if ($name === '' || $email === '' || $pass === '') {
             json_error('جميع الحقول مطلوبة');
@@ -123,28 +131,63 @@ switch ($action) {
         $pwError = validate_password_strength($pass);
         if ($pwError !== null) json_error($pwError);
 
-        $exists = db()->prepare('SELECT id FROM users WHERE email = ?');
+        $pdo = db();
+        $exists = $pdo->prepare('SELECT id FROM users WHERE email = ?');
         $exists->execute([$email]);
         if ($exists->fetch()) json_error('البريد الإلكتروني مستخدم بالفعل', 409);
 
         // ✅ bcrypt cost=12 للأمان
         $hash = password_hash($pass, PASSWORD_BCRYPT, ['cost' => 12]);
-        $ins  = db()->prepare(
-            'INSERT INTO users (name, email, password_hash, role) VALUES (?, ?, ?, ?)'
-        );
-        $ins->execute([$name, $email, $hash, $role]);
 
-        audit('تسجيل مستخدم جديد', $email);
-        json_ok(['success' => true, 'id' => (int)db()->lastInsertId()]);
+        // ✅ Multi-Tenant: إنشاء "متجر" جديد + مستخدم "مدير" مالك له ضمن معاملة
+        // واحدة ذرّية. العلاقة بين الجدولين دائرية (tenants.owner_user_id ->
+        // users.id، و users.tenant_id -> tenants.id)، فنحلّها بالتسلسل التالي:
+        //   1) إنشاء tenant بدون owner_user_id (NULL مؤقتاً)
+        //   2) إنشاء user مرتبطاً بـ tenant_id الجديد فوراً (يحقق NOT NULL)
+        //   3) تحديث owner_user_id على tenant لإكمال الربط الدائري
+        // أي فشل في أي خطوة => rollback كامل (لا يبقى متجر بلا مالك أو مستخدم
+        // بلا متجر أبداً).
+        $tenantId = null;
+        $userId   = null;
+        try {
+            $pdo->beginTransaction();
+
+            $tIns = $pdo->prepare('INSERT INTO tenants (name, plan) VALUES (?, ?) RETURNING id');
+            $tIns->execute([$storeName, 'free']);
+            $tenantId = (int)$tIns->fetchColumn();
+
+            $uIns = $pdo->prepare(
+                'INSERT INTO users (name, email, password_hash, role, tenant_id) VALUES (?, ?, ?, ?, ?) RETURNING id'
+            );
+            $uIns->execute([$name, $email, $hash, $role, $tenantId]);
+            $userId = (int)$uIns->fetchColumn();
+
+            $pdo->prepare('UPDATE tenants SET owner_user_id = ? WHERE id = ?')->execute([$userId, $tenantId]);
+
+            $pdo->commit();
+        } catch (Exception $e) {
+            if ($pdo->inTransaction()) $pdo->rollBack();
+            error_log('[Jawali][register] فشل إنشاء متجر جديد للمستخدم ' . $email . ': ' . $e->getMessage());
+            json_error('حدث خطأ أثناء إنشاء الحساب — حاول مرة أخرى', 500);
+        }
+
+        audit('تسجيل مستخدم جديد + إنشاء متجر مستقل', $email, 'info', $tenantId);
+        json_ok(['success' => true, 'id' => $userId, 'tenant_id' => $tenantId]);
         break;
 
     case 'me':
         $payload = require_auth();
-        $stmt = db()->prepare('SELECT id, name, email, role, branch_code FROM users WHERE id = ?');
+        $stmt = db()->prepare('SELECT id, name, email, role, branch_code, tenant_id FROM users WHERE id = ?');
         $stmt->execute([$payload['sub']]);
         $u = $stmt->fetch();
         if (!$u) json_error('المستخدم غير موجود', 404);
         $u['permissions'] = $payload['permissions'] ?? [];
+        // ✅ Multi-Tenant: اسم المتجر مفيد لعرضه في واجهة Flutter
+        try {
+            $t = db()->prepare('SELECT name FROM tenants WHERE id = ?');
+            $t->execute([$u['tenant_id']]);
+            $u['tenant_name'] = $t->fetchColumn() ?: null;
+        } catch (Exception $e) { $u['tenant_name'] = null; }
         json_ok(['success' => true, 'user' => $u]);
         break;
 
@@ -161,13 +204,16 @@ switch ($action) {
         json_ok(['success' => true]);
         break;
 
-    // ✅ تأكيد كلمة مرور المدير/المالك — يُستخدم في العمليات الحساسة (حذف
+    // ✅ تأكيد كلمة مرور مدير المتجر — يُستخدم في العمليات الحساسة (حذف
     // فاتورة، خصم كبير...) دون الحاجة لتسجيل خروج المستخدم الحالي وتسجيل
     // دخول المدير بدلاً منه. يتطلب Authorization الحالي (أي مستخدم) + بيانات
-    // مدير/مالك صريحة في الـ body.
+    // مدير صريحة في الـ body.
+    // ✅ Multi-Tenant: المدير المؤكِّد يجب أن يكون من نفس متجر (tenant) الطالب
+    // نفسه — يمنع تأكيد عملية حساسة في متجر باستخدام حساب مدير متجر آخر تماماً.
     case 'confirm_admin':
         if ($method !== 'POST') json_error('استخدم POST', 405);
-        require_auth();
+        $auth = require_auth();
+        $requesterTenantId = tenant_id_from_auth($auth);
         $body = input_json();
         $adminEmail = strtolower(trim($body['admin_email'] ?? ''));
         $adminPass  = (string)($body['admin_password'] ?? '');
@@ -178,20 +224,21 @@ switch ($action) {
         rl_check('confirm_admin', $adminEmail . '|' . $ip, 5, 900);
 
         $stmt = db()->prepare(
-            'SELECT id, role, password_hash, is_active FROM users WHERE email = ? LIMIT 1'
+            'SELECT id, role, password_hash, is_active, tenant_id FROM users WHERE email = ? LIMIT 1'
         );
         $stmt->execute([$adminEmail]);
         $admin = $stmt->fetch();
         if (!$admin || !$admin['is_active'] ||
-            !in_array($admin['role'], ['مدير', 'المالك'], true) ||
+            $admin['role'] !== 'مدير' ||
+            (int)($admin['tenant_id'] ?? -1) !== $requesterTenantId ||
             !password_verify($adminPass, $admin['password_hash'] ?? '')
         ) {
             usleep(300000);
-            audit('فشل تأكيد صلاحية مدير للعملية الحساسة', $adminEmail, 'warning');
+            audit('فشل تأكيد صلاحية مدير للعملية الحساسة', $adminEmail, 'warning', $requesterTenantId);
             json_error('بيانات المدير غير صحيحة', 401);
         }
         rl_clear('confirm_admin', $adminEmail . '|' . $ip);
-        audit('تأكيد صلاحية مدير لعملية حساسة', $adminEmail);
+        audit('تأكيد صلاحية مدير لعملية حساسة', $adminEmail, 'info', $requesterTenantId);
         json_ok(['success' => true]);
         break;
 

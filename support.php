@@ -39,12 +39,14 @@ function support_ensure_tables(): void {
             status VARCHAR(20) NOT NULL DEFAULT 'open',
             priority VARCHAR(20) NOT NULL DEFAULT 'normal',
             is_pro_ticket SMALLINT NOT NULL DEFAULT 0,
+            tenant_id INTEGER,
             created_at TIMESTAMP NOT NULL DEFAULT now(),
             updated_at TIMESTAMP NOT NULL DEFAULT now()
         );
         CREATE INDEX IF NOT EXISTS idx_support_tickets_user ON support_tickets(user_id);
         CREATE INDEX IF NOT EXISTS idx_support_tickets_status ON support_tickets(status);
         CREATE INDEX IF NOT EXISTS idx_support_tickets_priority ON support_tickets(priority);
+        CREATE INDEX IF NOT EXISTS idx_support_tickets_tenant ON support_tickets(tenant_id);
 
         CREATE TABLE IF NOT EXISTS support_messages (
             id SERIAL PRIMARY KEY,
@@ -52,10 +54,20 @@ function support_ensure_tables(): void {
             sender_role VARCHAR(20) NOT NULL,
             sender_email VARCHAR(160),
             message TEXT NOT NULL,
+            tenant_id INTEGER,
             created_at TIMESTAMP NOT NULL DEFAULT now()
         );
         CREATE INDEX IF NOT EXISTS idx_support_messages_ticket ON support_messages(ticket_id);
+        CREATE INDEX IF NOT EXISTS idx_support_messages_tenant ON support_messages(tenant_id);
     ");
+    // ✅ Multi-Tenant: ترقية آمنة إن كانت الجداول موجودة مسبقاً بدون tenant_id
+    $upgrades = [
+        "ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS tenant_id INTEGER",
+        "ALTER TABLE support_messages ADD COLUMN IF NOT EXISTS tenant_id INTEGER",
+    ];
+    foreach ($upgrades as $sql) {
+        try { db()->exec($sql); } catch (Exception $e) { /* العمود موجود مسبقاً */ }
+    }
     $done = true;
 }
 support_ensure_tables();
@@ -64,10 +76,10 @@ function support_is_admin(array $auth): bool {
     return ($auth['role'] ?? '') === 'مدير';
 }
 
-/** يتأكد أن التذكرة تخص المستخدم الحالي أو أنه مدير — يرجع سجل التذكرة أو ينهي بخطأ */
-function support_load_ticket_for(PDO $pdo, int $ticketId, array $auth): array {
-    $stmt = $pdo->prepare('SELECT * FROM support_tickets WHERE id = ?');
-    $stmt->execute([$ticketId]);
+/** يتأكد أن التذكرة تخص المستخدم الحالي أو أنه مدير في نفس المتجر — يرجع سجل التذكرة أو ينهي بخطأ */
+function support_load_ticket_for(PDO $pdo, int $ticketId, array $auth, int $tenantId): array {
+    $stmt = $pdo->prepare('SELECT * FROM support_tickets WHERE id = ? AND tenant_id = ?');
+    $stmt->execute([$ticketId, $tenantId]);
     $ticket = $stmt->fetch();
     if (!$ticket) json_error('التذكرة غير موجودة', 404);
     if (!support_is_admin($auth) && (int)$ticket['user_id'] !== (int)$auth['sub']) {
@@ -82,9 +94,10 @@ switch ($action) {
     // ═════════════════════════════════════════════════════════════════════════
     case 'create': {
         if ($method !== 'POST') json_error('استخدم POST', 405);
-        $auth   = require_auth();
-        $userId = (int)$auth['sub'];
-        $email  = (string)$auth['email'];
+        $auth     = require_auth();
+        $tenantId = tenant_id_from_auth($auth);
+        $userId   = (int)$auth['sub'];
+        $email    = (string)$auth['email'];
 
         // ✅ حماية من الإسبام: 10 تذاكر كحد أقصى كل ساعة لكل مستخدم
         $ip = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
@@ -109,17 +122,17 @@ switch ($action) {
         try {
             $ins = $pdo->prepare(
                 'INSERT INTO support_tickets
-                    (user_id, user_email, subject, status, priority, is_pro_ticket)
-                 VALUES (?,?,?, \'open\', ?, ?)'
+                    (user_id, user_email, subject, status, priority, is_pro_ticket, tenant_id)
+                 VALUES (?,?,?, \'open\', ?, ?, ?)'
             );
-            $ins->execute([$userId, $email, $subject, $priority, $isPro ? 1 : 0]);
+            $ins->execute([$userId, $email, $subject, $priority, $isPro ? 1 : 0, $tenantId]);
             $ticketId = (int)$pdo->lastInsertId();
 
             $msg = $pdo->prepare(
-                'INSERT INTO support_messages (ticket_id, sender_role, sender_email, message)
-                 VALUES (?, \'user\', ?, ?)'
+                'INSERT INTO support_messages (ticket_id, sender_role, sender_email, message, tenant_id)
+                 VALUES (?, \'user\', ?, ?, ?)'
             );
-            $msg->execute([$ticketId, $email, $message]);
+            $msg->execute([$ticketId, $email, $message, $tenantId]);
 
             $pdo->commit();
         } catch (Exception $e) {
@@ -128,7 +141,7 @@ switch ($action) {
             json_error('تعذّر إنشاء التذكرة', 500);
         }
 
-        audit('فتح تذكرة دعم فني جديدة #' . $ticketId, $email);
+        audit('فتح تذكرة دعم فني جديدة #' . $ticketId, $email, 'info', $tenantId);
         json_ok([
             'success'   => true,
             'message'   => 'تم استلام تذكرتك، سيتم الرد عليك في أقرب وقت',
@@ -142,27 +155,29 @@ switch ($action) {
     // GET — قائمة التذاكر (المستخدم يرى تذاكره فقط، المدير يرى الكل)
     // ═════════════════════════════════════════════════════════════════════════
     case 'list': {
-        $auth = require_auth();
+        $auth     = require_auth();
+        $tenantId = tenant_id_from_auth($auth);
 
         if (support_is_admin($auth)) {
             $statusFilter = $_GET['status'] ?? '';
             if ($statusFilter !== '' && in_array($statusFilter, ['open', 'answered', 'closed'], true)) {
                 $stmt = $pdo->prepare(
-                    'SELECT * FROM support_tickets WHERE status = ?
+                    'SELECT * FROM support_tickets WHERE status = ? AND tenant_id = ?
                      ORDER BY is_pro_ticket DESC, id DESC LIMIT 300'
                 );
-                $stmt->execute([$statusFilter]);
+                $stmt->execute([$statusFilter, $tenantId]);
             } else {
-                $stmt = $pdo->query(
-                    'SELECT * FROM support_tickets
+                $stmt = $pdo->prepare(
+                    'SELECT * FROM support_tickets WHERE tenant_id = ?
                      ORDER BY is_pro_ticket DESC, id DESC LIMIT 300'
                 );
+                $stmt->execute([$tenantId]);
             }
         } else {
             $stmt = $pdo->prepare(
-                'SELECT * FROM support_tickets WHERE user_id = ? ORDER BY id DESC LIMIT 200'
+                'SELECT * FROM support_tickets WHERE user_id = ? AND tenant_id = ? ORDER BY id DESC LIMIT 200'
             );
-            $stmt->execute([(int)$auth['sub']]);
+            $stmt->execute([(int)$auth['sub'], $tenantId]);
         }
 
         json_ok(['success' => true, 'tickets' => $stmt->fetchAll()]);
@@ -173,16 +188,17 @@ switch ($action) {
     // GET — محادثة تذكرة محدّدة
     // ═════════════════════════════════════════════════════════════════════════
     case 'messages': {
-        $auth = require_auth();
+        $auth     = require_auth();
+        $tenantId = tenant_id_from_auth($auth);
         $ticketId = (int)($_GET['ticket_id'] ?? 0);
         if ($ticketId <= 0) json_error('ticket_id مطلوب');
 
-        $ticket = support_load_ticket_for($pdo, $ticketId, $auth);
+        $ticket = support_load_ticket_for($pdo, $ticketId, $auth, $tenantId);
 
         $stmt = $pdo->prepare(
-            'SELECT * FROM support_messages WHERE ticket_id = ? ORDER BY id ASC'
+            'SELECT * FROM support_messages WHERE ticket_id = ? AND tenant_id = ? ORDER BY id ASC'
         );
-        $stmt->execute([$ticketId]);
+        $stmt->execute([$ticketId, $tenantId]);
 
         json_ok([
             'success'  => true,
@@ -197,7 +213,8 @@ switch ($action) {
     // ═════════════════════════════════════════════════════════════════════════
     case 'reply': {
         if ($method !== 'POST') json_error('استخدم POST', 405);
-        $auth = require_auth();
+        $auth     = require_auth();
+        $tenantId = tenant_id_from_auth($auth);
 
         // ✅ حماية من الإسبام: 30 رداً كحد أقصى كل ساعة لكل مستخدم/آي‌بي
         // (نفس نمط الحماية المطبَّق في action=create وباقي endpoints الحساسة)
@@ -211,7 +228,7 @@ switch ($action) {
         if ($message === '') json_error('نص الرسالة مطلوب');
         if (mb_strlen($message) > 4000) $message = mb_substr($message, 0, 4000);
 
-        $ticket  = support_load_ticket_for($pdo, $ticketId, $auth);
+        $ticket  = support_load_ticket_for($pdo, $ticketId, $auth, $tenantId);
         $isAdmin = support_is_admin($auth);
 
         if ($ticket['status'] === 'closed') {
@@ -221,21 +238,22 @@ switch ($action) {
         $pdo->beginTransaction();
         try {
             $ins = $pdo->prepare(
-                'INSERT INTO support_messages (ticket_id, sender_role, sender_email, message)
-                 VALUES (?, ?, ?, ?)'
+                'INSERT INTO support_messages (ticket_id, sender_role, sender_email, message, tenant_id)
+                 VALUES (?, ?, ?, ?, ?)'
             );
             $ins->execute([
                 $ticketId,
                 $isAdmin ? 'admin' : 'user',
                 (string)($auth['email'] ?? ''),
                 $message,
+                $tenantId,
             ]);
 
             // ✅ حالة التذكرة: رد المدير → answered، رد المستخدم يعيدها إلى open
             $newStatus = $isAdmin ? 'answered' : 'open';
             $pdo->prepare(
-                'UPDATE support_tickets SET status = ?, updated_at = now() WHERE id = ?'
-            )->execute([$newStatus, $ticketId]);
+                'UPDATE support_tickets SET status = ?, updated_at = now() WHERE id = ? AND tenant_id = ?'
+            )->execute([$newStatus, $ticketId, $tenantId]);
 
             $pdo->commit();
         } catch (Exception $e) {
@@ -244,7 +262,7 @@ switch ($action) {
             json_error('تعذّر إضافة الرد', 500);
         }
 
-        audit(($isAdmin ? 'رد المدير على' : 'رد المستخدم على') . " تذكرة دعم #$ticketId", (string)($auth['email'] ?? ''));
+        audit(($isAdmin ? 'رد المدير على' : 'رد المستخدم على') . " تذكرة دعم #$ticketId", (string)($auth['email'] ?? ''), 'info', $tenantId);
         json_ok(['success' => true, 'message' => 'تم إضافة الرد']);
         break;
     }
@@ -254,14 +272,15 @@ switch ($action) {
     // ═════════════════════════════════════════════════════════════════════════
     case 'update': {
         if ($method !== 'POST') json_error('استخدم POST', 405);
-        $admin = require_admin();
+        $admin    = require_admin();
+        $tenantId = tenant_id_from_auth($admin);
         $body = input_json();
         $ticketId = (int)($body['ticket_id'] ?? 0);
         if ($ticketId <= 0) json_error('ticket_id مطلوب');
 
-        $stmt = $pdo->prepare('SELECT id FROM support_tickets WHERE id = ?');
-        $stmt->execute([$ticketId]);
-        if (!$stmt->fetch()) json_error('التذكرة غير موجودة', 404);
+        $stmt = $pdo->prepare('SELECT id FROM support_tickets WHERE id = ? AND tenant_id = ?');
+        $stmt->execute([$ticketId, $tenantId]);
+        if (!$stmt->fetch()) json_error('التذكرة غير موجودة في متجرك', 404);
 
         $fields = [];
         $values = [];
@@ -277,10 +296,11 @@ switch ($action) {
 
         $fields[] = 'updated_at = now()';
         $values[] = $ticketId;
-        $pdo->prepare('UPDATE support_tickets SET ' . implode(', ', $fields) . ' WHERE id = ?')
+        $values[] = $tenantId;
+        $pdo->prepare('UPDATE support_tickets SET ' . implode(', ', $fields) . ' WHERE id = ? AND tenant_id = ?')
             ->execute($values);
 
-        audit("تحديث تذكرة دعم #$ticketId", $admin['email'] ?? null);
+        audit("تحديث تذكرة دعم #$ticketId", $admin['email'] ?? null, 'info', $tenantId);
         json_ok(['success' => true, 'message' => 'تم التحديث']);
         break;
     }

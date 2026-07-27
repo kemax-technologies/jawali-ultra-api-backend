@@ -26,15 +26,25 @@ if (!defined('PRO_PLAN_DAYS')) {
  * @param PDO    $pdo
  * @param int    $requestId
  * @param string $reviewedBy  البريد الإلكتروني للمدير، أو 'developer' من لوحة المطوّر
+ * @param int|null $tenantId  Multi-Tenant: مُمرَّر من pro.php لتقييد البحث بمتجر
+ *                            المدير الحالي؛ null من dev_pro.php (بلا تقييد — كل المتاجر)
  * @return array ['request' => array, 'expires_at' => string]
  * @throws Exception في حال عدم وجود الطلب أو كونه غير معلّق (pending)
  */
-function pro_approve_request(PDO $pdo, int $requestId, string $reviewedBy): array {
-    $stmt = $pdo->prepare('SELECT * FROM pro_requests WHERE id = ?');
-    $stmt->execute([$requestId]);
+function pro_approve_request(PDO $pdo, int $requestId, string $reviewedBy, ?int $tenantId = null): array {
+    // ✅ Multi-Tenant: عند تمرير $tenantId (من pro.php — لوحة تحكم المتجر) يُقيَّد
+    // البحث بمتجر المدير الحالي فقط. عند تركه null (من dev_pro.php — لوحة تحكم
+    // المطوّر) يبقى البحث بلا تقييد عمداً لأن المطوّر يدير كل المتاجر.
+    if ($tenantId !== null) {
+        $stmt = $pdo->prepare('SELECT * FROM pro_requests WHERE id = ? AND tenant_id = ?');
+        $stmt->execute([$requestId, $tenantId]);
+    } else {
+        $stmt = $pdo->prepare('SELECT * FROM pro_requests WHERE id = ?');
+        $stmt->execute([$requestId]);
+    }
     $req = $stmt->fetch();
     if (!$req) {
-        json_error('الطلب غير موجود', 404);
+        json_error($tenantId !== null ? 'الطلب غير موجود في متجرك' : 'الطلب غير موجود', 404);
     }
     if ($req['status'] !== 'pending') {
         json_error('تمت مراجعة هذا الطلب مسبقاً', 409);
@@ -74,12 +84,17 @@ function pro_approve_request(PDO $pdo, int $requestId, string $reviewedBy): arra
  * @param string $reason
  * @return array الطلب قبل الرفض (لأغراض التسجيل/audit)
  */
-function pro_reject_request(PDO $pdo, int $requestId, string $reviewedBy, string $reason): array {
-    $stmt = $pdo->prepare('SELECT * FROM pro_requests WHERE id = ?');
-    $stmt->execute([$requestId]);
+function pro_reject_request(PDO $pdo, int $requestId, string $reviewedBy, string $reason, ?int $tenantId = null): array {
+    if ($tenantId !== null) {
+        $stmt = $pdo->prepare('SELECT * FROM pro_requests WHERE id = ? AND tenant_id = ?');
+        $stmt->execute([$requestId, $tenantId]);
+    } else {
+        $stmt = $pdo->prepare('SELECT * FROM pro_requests WHERE id = ?');
+        $stmt->execute([$requestId]);
+    }
     $req = $stmt->fetch();
     if (!$req) {
-        json_error('الطلب غير موجود', 404);
+        json_error($tenantId !== null ? 'الطلب غير موجود في متجرك' : 'الطلب غير موجود', 404);
     }
     if ($req['status'] !== 'pending') {
         json_error('تمت مراجعة هذا الطلب مسبقاً', 409);

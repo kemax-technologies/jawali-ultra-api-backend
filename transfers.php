@@ -22,13 +22,13 @@ $method = $_SERVER['REQUEST_METHOD'];
 $pdo    = db();
 
 /** توليد رمز استلام عشوائي مكوّن من 6 أرقام (غير مستخدم مسبقاً) */
-function generate_receive_code(PDO $pdo): string {
+function generate_receive_code(PDO $pdo, int $tenantId): string {
     do {
         $code = (string)random_int(100000, 999999);
         $stmt = $pdo->prepare(
-            "SELECT COUNT(*) FROM money_transfers WHERE receive_code = ? AND status = 'pending'"
+            "SELECT COUNT(*) FROM money_transfers WHERE receive_code = ? AND status = 'pending' AND tenant_id = ?"
         );
-        $stmt->execute([$code]);
+        $stmt->execute([$code, $tenantId]);
         $exists = (int)$stmt->fetchColumn() > 0;
     } while ($exists);
     return $code;
@@ -39,14 +39,15 @@ switch ($method) {
     // GET
     // ─────────────────────────────────────────────────────────────────────────
     case 'GET': {
-        require_auth();
+        $auth = require_auth();
+        $tenantId = tenant_id_from_auth($auth);
 
         // البحث عن تحويل معلّق برمز الاستلام (للتحقق قبل الصرف)
         if (!empty($_GET['code'])) {
             $stmt = $pdo->prepare(
-                "SELECT * FROM money_transfers WHERE receive_code = ? AND status = 'pending' LIMIT 1"
+                "SELECT * FROM money_transfers WHERE receive_code = ? AND status = 'pending' AND tenant_id = ? LIMIT 1"
             );
-            $stmt->execute([$_GET['code']]);
+            $stmt->execute([$_GET['code'], $tenantId]);
             $tr = $stmt->fetch();
             if (!$tr) json_error('لم يُعثر على تحويل معلّق بهذا الرمز', 404);
             json_ok($tr);
@@ -54,16 +55,16 @@ switch ($method) {
 
         // تحويل محدد بالمعرّف
         if (!empty($_GET['id'])) {
-            $stmt = $pdo->prepare('SELECT * FROM money_transfers WHERE id = ? LIMIT 1');
-            $stmt->execute([$_GET['id']]);
+            $stmt = $pdo->prepare('SELECT * FROM money_transfers WHERE id = ? AND tenant_id = ? LIMIT 1');
+            $stmt->execute([$_GET['id'], $tenantId]);
             $tr = $stmt->fetch();
             if (!$tr) json_error('التحويل غير موجود', 404);
             json_ok($tr);
         }
 
         // قائمة كل التحويلات (مع فلتر اختياري بالحالة)
-        $sql  = 'SELECT * FROM money_transfers WHERE 1=1';
-        $args = [];
+        $sql  = 'SELECT * FROM money_transfers WHERE tenant_id = ?';
+        $args = [$tenantId];
         if (!empty($_GET['status'])) {
             $sql .= ' AND status = ?';
             $args[] = $_GET['status'];
@@ -79,7 +80,8 @@ switch ($method) {
     // POST — إنشاء تحويل جديد / صرف / إلغاء
     // ─────────────────────────────────────────────────────────────────────────
     case 'POST': {
-        require_auth();
+        $auth = require_auth();
+        $tenantId = tenant_id_from_auth($auth);
         $action = $_GET['action'] ?? '';
         $body   = input_json();
         $userEmail = $_SERVER['HTTP_X_USER_EMAIL'] ?? null;
@@ -91,9 +93,9 @@ switch ($method) {
             if ($code === '') json_error('رمز الاستلام مطلوب');
 
             $stmt = $pdo->prepare(
-                "SELECT * FROM money_transfers WHERE receive_code = ? AND status = 'pending' LIMIT 1"
+                "SELECT * FROM money_transfers WHERE receive_code = ? AND status = 'pending' AND tenant_id = ? LIMIT 1"
             );
-            $stmt->execute([$code]);
+            $stmt->execute([$code, $tenantId]);
             $tr = $stmt->fetch();
             if (!$tr) json_error('لم يُعثر على تحويل معلّق بهذا الرمز', 404);
 
@@ -102,27 +104,27 @@ switch ($method) {
                 $pdo->prepare(
                     "UPDATE money_transfers
                      SET status = 'completed', completed_by = ?, completed_at = NOW(), payout_cash_account_id = ?
-                     WHERE id = ?"
-                )->execute([$userEmail, $payoutAccountId ?: null, $tr['id']]);
+                     WHERE id = ? AND tenant_id = ?"
+                )->execute([$userEmail, $payoutAccountId ?: null, $tr['id'], $tenantId]);
 
                 // إذا حُدِّد صندوق صرف، يُخصَم منه مبلغ التحويل الأساسي (بدون العمولة
                 // لأن العمولة إيراد وليست جزءاً من المبلغ المطلوب صرفه للمستلم)
                 if ($payoutAccountId !== '') {
-                    $accStmt = $pdo->prepare('SELECT * FROM cash_accounts WHERE id = ? LIMIT 1');
-                    $accStmt->execute([$payoutAccountId]);
+                    $accStmt = $pdo->prepare('SELECT * FROM cash_accounts WHERE id = ? AND tenant_id = ? LIMIT 1');
+                    $accStmt->execute([$payoutAccountId, $tenantId]);
                     $acc = $accStmt->fetch();
                     if ($acc) {
                         if ((float)$acc['balance'] < (float)$tr['amount']) {
                             throw new Exception('الرصيد غير كافٍ في صندوق الصرف');
                         }
-                        $pdo->prepare('UPDATE cash_accounts SET balance = balance - ? WHERE id = ?')
-                            ->execute([$tr['amount'], $payoutAccountId]);
+                        $pdo->prepare('UPDATE cash_accounts SET balance = balance - ? WHERE id = ? AND tenant_id = ?')
+                            ->execute([$tr['amount'], $payoutAccountId, $tenantId]);
                         $txId = 'TX-' . round(microtime(true) * 1000);
                         $pdo->prepare(
-                            'INSERT INTO cash_transactions (id, account_id, type, amount, currency, notes, created_by)
-                             VALUES (?, ?, ?, ?, ?, ?, ?)'
+                            'INSERT INTO cash_transactions (id, tenant_id, account_id, type, amount, currency, notes, created_by)
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
                         )->execute([
-                            $txId, $payoutAccountId, 'سحب', $tr['amount'], $tr['currency'],
+                            $txId, $tenantId, $payoutAccountId, 'سحب', $tr['amount'], $tr['currency'],
                             'صرف حوالة رمز ' . $code, $userEmail,
                         ]);
                     }
@@ -135,7 +137,7 @@ switch ($method) {
                 json_error($e->getMessage() ?: 'فشل تنفيذ عملية الصرف', 500);
             }
 
-            audit("transfer completed {$tr['id']} code=$code");
+            audit("transfer completed {$tr['id']} code=$code", null, 'info', $tenantId);
             json_ok(['success' => true, 'id' => $tr['id']]);
             break;
         }
@@ -145,26 +147,26 @@ switch ($method) {
             $id = trim($body['id'] ?? '');
             if ($id === '') json_error('id مطلوب');
 
-            $stmt = $pdo->prepare("SELECT * FROM money_transfers WHERE id = ? AND status = 'pending' LIMIT 1");
-            $stmt->execute([$id]);
+            $stmt = $pdo->prepare("SELECT * FROM money_transfers WHERE id = ? AND status = 'pending' AND tenant_id = ? LIMIT 1");
+            $stmt->execute([$id, $tenantId]);
             $tr = $stmt->fetch();
             if (!$tr) json_error('التحويل غير موجود أو ليس معلّقاً', 404);
 
             $pdo->beginTransaction();
             try {
-                $pdo->prepare("UPDATE money_transfers SET status = 'cancelled', completed_by = ?, completed_at = NOW() WHERE id = ?")
-                    ->execute([$userEmail, $id]);
+                $pdo->prepare("UPDATE money_transfers SET status = 'cancelled', completed_by = ?, completed_at = NOW() WHERE id = ? AND tenant_id = ?")
+                    ->execute([$userEmail, $id, $tenantId]);
 
                 // استرجاع المبلغ الكامل (أصل + عمولة) لصندوق الإرسال إن كان محدداً
                 if (!empty($tr['cash_account_id'])) {
-                    $pdo->prepare('UPDATE cash_accounts SET balance = balance + ? WHERE id = ?')
-                        ->execute([$tr['total'], $tr['cash_account_id']]);
+                    $pdo->prepare('UPDATE cash_accounts SET balance = balance + ? WHERE id = ? AND tenant_id = ?')
+                        ->execute([$tr['total'], $tr['cash_account_id'], $tenantId]);
                     $txId = 'TX-' . round(microtime(true) * 1000);
                     $pdo->prepare(
-                        'INSERT INTO cash_transactions (id, account_id, type, amount, currency, notes, created_by)
-                         VALUES (?, ?, ?, ?, ?, ?, ?)'
+                        'INSERT INTO cash_transactions (id, tenant_id, account_id, type, amount, currency, notes, created_by)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
                     )->execute([
-                        $txId, $tr['cash_account_id'], 'إيداع', $tr['total'], $tr['currency'],
+                        $txId, $tenantId, $tr['cash_account_id'], 'إيداع', $tr['total'], $tr['currency'],
                         'استرجاع حوالة ملغاة ' . $id, $userEmail,
                     ]);
                 }
@@ -176,7 +178,7 @@ switch ($method) {
                 json_error('فشل تنفيذ الإلغاء', 500);
             }
 
-            audit("transfer cancelled $id");
+            audit("transfer cancelled $id", null, 'info', $tenantId);
             json_ok(['success' => true, 'id' => $id]);
             break;
         }
@@ -199,37 +201,37 @@ switch ($method) {
 
         $total = $amount + $commission;
         $id    = 'TR-' . round(microtime(true) * 1000);
-        $code  = generate_receive_code($pdo);
+        $code  = generate_receive_code($pdo, $tenantId);
 
         $pdo->beginTransaction();
         try {
             // إذا حُدِّد صندوق إرسال، يُضاف إليه المبلغ الإجمالي (المبلغ + العمولة)
             // كإيداع فوري (المرسل يدفع نقداً في نقطة الخدمة)
             if ($cashAccountId !== '') {
-                $accStmt = $pdo->prepare('SELECT * FROM cash_accounts WHERE id = ? LIMIT 1');
-                $accStmt->execute([$cashAccountId]);
+                $accStmt = $pdo->prepare('SELECT * FROM cash_accounts WHERE id = ? AND tenant_id = ? LIMIT 1');
+                $accStmt->execute([$cashAccountId, $tenantId]);
                 $acc = $accStmt->fetch();
                 if (!$acc) throw new Exception('صندوق الاستلام غير موجود');
-                $pdo->prepare('UPDATE cash_accounts SET balance = balance + ? WHERE id = ?')
-                    ->execute([$total, $cashAccountId]);
+                $pdo->prepare('UPDATE cash_accounts SET balance = balance + ? WHERE id = ? AND tenant_id = ?')
+                    ->execute([$total, $cashAccountId, $tenantId]);
                 $txId = 'TX-' . round(microtime(true) * 1000);
                 $pdo->prepare(
-                    'INSERT INTO cash_transactions (id, account_id, type, amount, currency, notes, created_by)
-                     VALUES (?, ?, ?, ?, ?, ?, ?)'
+                    'INSERT INTO cash_transactions (id, tenant_id, account_id, type, amount, currency, notes, created_by)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
                 )->execute([
-                    $txId, $cashAccountId, 'إيداع', $total, $currency,
+                    $txId, $tenantId, $cashAccountId, 'إيداع', $total, $currency,
                     "استلام حوالة صادرة $id", $_SERVER['HTTP_X_USER_EMAIL'] ?? null,
                 ]);
             }
 
             $pdo->prepare(
                 'INSERT INTO money_transfers
-                    (id, sender_name, sender_phone, receiver_name, receiver_phone,
+                    (id, tenant_id, sender_name, sender_phone, receiver_name, receiver_phone,
                      amount, commission, total, currency, cash_account_id, receive_code,
                      status, notes, created_by)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
             )->execute([
-                $id, $senderName, $senderPhone, $receiverName, $receiverPhone,
+                $id, $tenantId, $senderName, $senderPhone, $receiverName, $receiverPhone,
                 $amount, $commission, $total, $currency, $cashAccountId ?: null, $code,
                 'pending', $notes, $_SERVER['HTTP_X_USER_EMAIL'] ?? null,
             ]);
@@ -241,7 +243,7 @@ switch ($method) {
             json_error($e->getMessage() ?: 'فشل إنشاء التحويل', 500);
         }
 
-        audit("create transfer $id amount=$amount commission=$commission code=$code");
+        audit("create transfer $id amount=$amount commission=$commission code=$code", null, 'info', $tenantId);
         json_ok(['success' => true, 'id' => $id, 'receive_code' => $code]);
         break;
     }
@@ -250,11 +252,14 @@ switch ($method) {
     // DELETE — حذف سجل تحويل (للمدير فقط، لأغراض تنظيف البيانات فقط)
     // ─────────────────────────────────────────────────────────────────────────
     case 'DELETE': {
-        require_admin();
+        $auth = require_admin();
+        $tenantId = tenant_id_from_auth($auth);
         $id = $_GET['id'] ?? '';
         if ($id === '') json_error('id مطلوب');
-        $pdo->prepare('DELETE FROM money_transfers WHERE id = ?')->execute([$id]);
-        audit("delete transfer $id", null, 'warning');
+        $stmt = $pdo->prepare('DELETE FROM money_transfers WHERE id = ? AND tenant_id = ?');
+        $stmt->execute([$id, $tenantId]);
+        if ($stmt->rowCount() === 0) json_error('التحويل غير موجود في متجرك', 404);
+        audit("delete transfer $id", null, 'warning', $tenantId);
         json_ok(['success' => true]);
         break;
     }
