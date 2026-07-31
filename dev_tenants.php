@@ -121,6 +121,13 @@ if ($method === 'POST') {
             try {
                 $pdo->beginTransaction();
 
+                // ✅ Task 7 — audit_log أصبح غير قابل للتعديل/الحذف على مستوى
+                // قاعدة البيانات (Trigger) إلا ضمن هذا الاستثناء المقصود
+                // بالذات: حذف متجر بالكامل هنا. هذا المتغيّر محلي للمعاملة
+                // (transaction-scoped GUC) ويُعاد تلقائياً لقيمته الافتراضية
+                // عند COMMIT/ROLLBACK — لا يمكن أن يبقى مفعَّلاً بالخطأ.
+                $pdo->exec("SET LOCAL jawali.allow_audit_purge = 'on'");
+
                 // فكّ الحلقة الدائرية (tenants.owner_user_id <-> users.tenant_id)
                 // قبل الحذف الفعلي لتجنّب انتهاك قيود FK.
                 $pdo->prepare('UPDATE tenants SET owner_user_id = NULL WHERE id = ?')->execute([$tenantId]);
