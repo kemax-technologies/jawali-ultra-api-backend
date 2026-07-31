@@ -4,8 +4,12 @@ require_once __DIR__ . '/_db.php';
 $method = $_SERVER['REQUEST_METHOD'];
 $pdo    = db();
 
-// ✅ إصلاح #7: جميع عمليات المستخدمين تتطلب دور مدير
-$auth = require_admin();
+// ✅ إصلاح دقة الصلاحيات: كانت هذه الدالة تستخدم require_admin() (فحص دور
+// حرفي "مدير" فقط)، وهذا يتجاوز نظام الصلاحيات الدقيقة (RBAC) — "مدير فرع"
+// يملك صلاحية manageUsers ضمن صلاحياته الافتراضية (role_default_permissions
+// في _db.php) لكنه كان يُحظر هنا بلا داعٍ. التصحيح: استخدام require_permission
+// المبنية على الصلاحية الفعلية بدل الدور الحرفي.
+$auth = require_permission('manageUsers');
 // ✅ Multi-Tenant: كل عملية هنا مقيّدة بمتجر المدير الحالي فقط — يمنع أي
 // مدير متجر من رؤية/تعديل/حذف مستخدمي متجر آخر.
 $tenantId = tenant_id_from_auth($auth);

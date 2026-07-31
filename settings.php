@@ -17,7 +17,10 @@ switch ($method) {
         break;
     }
     case 'POST': {
-        $auth = require_auth();
+        // ✅ إصلاح تجاوز صلاحيات: تعديل إعدادات المتجر يتطلب صلاحية
+        // "settings" الدقيقة بدل مجرد تسجيل الدخول — كانت متاحة سابقاً لأي
+        // مستخدم مصادَق بغض النظر عن دوره.
+        $auth = require_permission('settings');
         $tenantId = tenant_id_from_auth($auth);
         $b = input_json();
         // ✅ تحويل PostgreSQL: ON DUPLICATE KEY UPDATE → ON CONFLICT DO UPDATE SET

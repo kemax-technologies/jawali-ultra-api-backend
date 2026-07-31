@@ -17,8 +17,11 @@ switch ($method) {
         break;
     }
     case 'GET': {
-        // ✅ إصلاح #3: حماية GET بالمصادقة + تقييد بدور المدير فقط
-        $payload  = require_admin();
+        // ✅ إصلاح دقة الصلاحيات: كانت مقيّدة بـ require_admin() (دور "مدير"
+        // حرفياً فقط)، بينما "محاسب" و"مدير فرع" يملكان صلاحية activityLog
+        // ضمن صلاحياتهما الافتراضية ولا يستطيعان الوصول لسجل التدقيق بسبب
+        // هذا الفحص الحرفي. التصحيح: استخدام الصلاحية الدقيقة بدل الدور.
+        $payload  = require_permission('activityLog');
         $tenantId = tenant_id_from_auth($payload);
         $limit    = min((int)($_GET['limit'] ?? 100), 1000);
         $stmt     = db()->prepare(

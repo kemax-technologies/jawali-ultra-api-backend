@@ -63,7 +63,11 @@ switch ($method) {
     }
 
     case 'POST': {
-        $auth = require_auth();
+        // ✅ إصلاح تجاوز صلاحيات: كانت هذه العملية تُنشئ/تعدّل منتجات بمجرد
+        // require_auth() فقط، فيستطيع أي مستخدم مصادَق (حتى كاشير أو خدمة
+        // عملاء اللذين لا يملكان صلاحية editProducts افتراضياً) إنشاء/تعديل
+        // منتجات. التصحيح: تقييدها بصلاحية "editProducts" الدقيقة.
+        $auth = require_permission('editProducts');
         $tenantId = tenant_id_from_auth($auth);
         $body = input_json();
         $sku  = trim($body['sku'] ?? '');
@@ -126,7 +130,9 @@ switch ($method) {
     }
 
     case 'DELETE': {
-        $auth = require_auth();
+        // ✅ إصلاح تجاوز صلاحيات: نفس منطق POST أعلاه — حذف منتج يتطلب
+        // صلاحية "editProducts" الدقيقة بدل مجرد تسجيل الدخول.
+        $auth = require_permission('editProducts');
         $tenantId = tenant_id_from_auth($auth);
         $sku = $_GET['sku'] ?? '';
         if ($sku === '') json_error('SKU مطلوب');

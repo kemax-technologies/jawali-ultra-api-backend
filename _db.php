@@ -406,6 +406,17 @@ function require_permission(string $permission): array {
     return $auth;
 }
 
+// ✅ فحص صلاحية دقيقة من مصفوفة $auth مُستخرجة مسبقاً (بدون إعادة استدعاء
+// require_auth() وإعادة الاستعلام من قاعدة البيانات). يُستخدم في الملفات التي
+// تحتاج صلاحيات مختلفة لكل action/type ضمن نفس الطلب (مثل reports.php) حيث
+// require_auth() نُفِّذ مرة واحدة بالفعل في أعلى الملف.
+function ensure_permission(array $auth, string $permission): void {
+    $perms = $auth['permissions'] ?? [];
+    if (!in_array($permission, $perms, true)) {
+        json_error('غير مصرح — تحتاج صلاحية "' . $permission . '"', 403);
+    }
+}
+
 // ── سجل تدقيق ────────────────────────────────────────────────────────────────
 // ✅ Multi-Tenant: $tenantId اختياري — يُمرَّر من الملف المستدعي عند توفره
 // (عادة من require_auth()['tenant_id']) لربط كل حدث بمتجره بدقة.

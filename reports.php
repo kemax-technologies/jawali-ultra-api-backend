@@ -28,6 +28,10 @@ function date_filter(string $col, string $from, string $to): array {
 switch ($type) {
     // ── لوحة التحكم ──────────────────────────────────────────────────────────
     case 'dashboard': {
+        // ✅ إصلاح تجاوز صلاحيات: كانت متاحة لأي مستخدم مصادَق بغض النظر عن
+        // دوره؛ الآن تتطلب صلاحية "reports" الدقيقة (كاشير مثلاً لا يملكها
+        // افتراضياً ولا يجب أن يرى لوحة تحكم المتجر المالية).
+        ensure_permission($auth, 'reports');
         $totalsStmt = $pdo->prepare(
             'SELECT
                 COALESCE(SUM(total),0)    AS total_sales,
@@ -74,6 +78,8 @@ switch ($type) {
 
     // ── تقرير المبيعات ───────────────────────────────────────────────────────
     case 'sales': {
+        // ✅ إصلاح تجاوز صلاحيات: يتطلب صلاحية "reports" الدقيقة.
+        ensure_permission($auth, 'reports');
         [$where, $args] = date_filter('date', $from, $to);
         $stmt = $pdo->prepare(
             "SELECT DATE(date) AS day,
@@ -101,6 +107,9 @@ switch ($type) {
 
     // ── تقرير الربحية ────────────────────────────────────────────────────────
     case 'profit': {
+        // ✅ إصلاح تجاوز صلاحيات: الربحية معلومة مالية حساسة — تتطلب صلاحية
+        // "profits" الدقيقة بدل مجرد تسجيل الدخول.
+        ensure_permission($auth, 'profits');
         [$where, $args] = date_filter('date', $from, $to);
         $rev = $pdo->prepare("SELECT COALESCE(SUM(total),0) AS v FROM invoices WHERE tenant_id = ? $where");
         $rev->execute(array_merge([$tenantId], $args));
@@ -125,6 +134,8 @@ switch ($type) {
 
     // ── أعلى المنتجات ────────────────────────────────────────────────────────
     case 'top_products': {
+        // ✅ إصلاح تجاوز صلاحيات: يتطلب صلاحية "reports" الدقيقة.
+        ensure_permission($auth, 'reports');
         $stmt = $pdo->prepare(
             'SELECT sku, name, sold, price, (price*sold) AS revenue
              FROM products WHERE tenant_id = ? ORDER BY sold DESC LIMIT 20'
@@ -137,6 +148,8 @@ switch ($type) {
 
     // ── تقرير المخزون ────────────────────────────────────────────────────────
     case 'inventory': {
+        // ✅ إصلاح تجاوز صلاحيات: يتطلب صلاحية "reports" الدقيقة.
+        ensure_permission($auth, 'reports');
         $stmt = $pdo->prepare(
             'SELECT * FROM products WHERE tenant_id = ? ORDER BY stock ASC LIMIT 500'
         );
@@ -148,6 +161,8 @@ switch ($type) {
 
     // ── تحليلات ──────────────────────────────────────────────────────────────
     case 'analytics': {
+        // ✅ إصلاح تجاوز صلاحيات: يتطلب صلاحية "reports" الدقيقة.
+        ensure_permission($auth, 'reports');
         // ✅ تحويل PostgreSQL: "" (علامتان مزدوجتان) هي identifier فاضي في Postgres، لا سلسلة نصية — استُخدمت علامة مفردة ''
         $byCategoryStmt = $pdo->prepare(
             'SELECT category, COUNT(*) AS count,
@@ -170,12 +185,13 @@ switch ($type) {
         break;
     }
 
-    // ── سجل التدقيق — للمديرين فقط ──────────────────────────────────────────
+    // ── سجل التدقيق ──────────────────────────────────────────────────────────
     case 'audit': {
-        // ✅ سجل التدقيق للمدير فقط
-        if (($auth['role'] ?? '') !== 'مدير') {
-            json_error('غير مصرح — يتطلب صلاحية مدير', 403);
-        }
+        // ✅ إصلاح دقة الصلاحيات: كان مقيّداً بفحص دور حرفي "مدير" فقط، بينما
+        // "محاسب" و"مدير فرع" يملكان صلاحية activityLog ضمن صلاحياتهما
+        // الافتراضية. التصحيح: استخدام الصلاحية الدقيقة بدل الدور الحرفي —
+        // نفس الإصلاح المطبَّق في audit.php لضمان الاتساق بين المسارين.
+        ensure_permission($auth, 'activityLog');
         $stmt = $pdo->prepare(
             'SELECT * FROM audit_log WHERE tenant_id = ? ORDER BY id DESC LIMIT ' . $limit
         );
