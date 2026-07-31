@@ -2,10 +2,17 @@
 /**
  * ─────────────────────────────────────────────────────────────────────────────
  * لوحة تحكم المطوّر — إحصائيات حية من قاعدة البيانات الفعلية (محمي)
- * GET ?action=overview → إحصائيات عامة (مستخدمون، فواتير، إيرادات، Pro)
- * GET ?action=users    → قائمة كل المستخدمين
+ * GET ?action=overview → إحصائيات عامة على مستوى المنصّة (حسابات/تفعيل/Pro فقط)
+ * GET ?action=users    → قائمة كل المستخدمين (بيانات حساب فقط — بلا بيانات تشغيلية)
  * GET ?action=pro      → قائمة طلبات ترقية Pro (كل الحالات)
- * GET ?action=audit    → آخر 50 حدث في سجل التدقيق
+ * GET ?action=audit    → آخر 50 حدث أمني في سجل التدقيق (تسجيل دخول/إجراءات إدارية)
+ *
+ * ⚠️ ملاحظة أمان (إلزامية): صاحب المنصّة (المطوّر) لا يملك tenant_id ولا يتبع
+ * أي متجر — لذلك لا يجوز أن يرى أي بيانات تشغيلية لأي متجر (فواتير/إيرادات/
+ * منتجات/عملاء/مخزون) بتاتاً، ولو كانت مجمّعة (aggregate) عبر كل المتاجر.
+ * دوره يقتصر حصراً على إدارة ترقيات Pro وحسابات المستخدمين على مستوى المنصّة.
+ * تم عمداً حذف total_invoices/total_revenue/total_products/total_customers/
+ * daily_sales من overview لأنها بيانات تشغيلية تخص المتاجر ولا تخص المطوّر.
  * ─────────────────────────────────────────────────────────────────────────────
  */
 require_once __DIR__ . '/_dev_db.php';
@@ -15,37 +22,25 @@ $pdo = db();
 $action = $_GET['action'] ?? 'overview';
 
 if ($action === 'overview') {
+    $totalTenants  = (int)$pdo->query('SELECT COUNT(*) FROM tenants')->fetchColumn();
+    $activeTenants = (int)$pdo->query('SELECT COUNT(*) FROM tenants WHERE is_active = 1')->fetchColumn();
     $totalUsers   = (int)$pdo->query('SELECT COUNT(*) FROM users')->fetchColumn();
     $activeUsers  = (int)$pdo->query('SELECT COUNT(*) FROM users WHERE is_active = 1')->fetchColumn();
     $proUsers     = (int)$pdo->query('SELECT COUNT(*) FROM users WHERE is_pro = 1')->fetchColumn();
     $pendingPro   = (int)$pdo->query("SELECT COUNT(*) FROM pro_requests WHERE status = 'pending'")->fetchColumn();
-    $totalInvoices = (int)$pdo->query('SELECT COUNT(*) FROM invoices')->fetchColumn();
-    $totalRevenue  = (float)$pdo->query('SELECT COALESCE(SUM(total),0) FROM invoices')->fetchColumn();
-    $totalProducts = (int)$pdo->query('SELECT COUNT(*) FROM products')->fetchColumn();
-    $totalCustomers = (int)$pdo->query('SELECT COUNT(*) FROM customers')->fetchColumn();
 
-    // آخر 30 يوم — فواتير يومية (للرسم البياني)
-    $daily = $pdo->query("
-        SELECT TO_CHAR(date, 'YYYY-MM-DD') AS d, COUNT(*) AS cnt, COALESCE(SUM(total),0) AS revenue
-        FROM invoices
-        WHERE date >= CURRENT_DATE - INTERVAL '30 days'
-        GROUP BY d ORDER BY d ASC
-    ")->fetchAll();
-
+    // ✅ بيانات حساب فقط (بلا أي مؤشر تشغيلي/مالي) — للسياق الإداري لمهام Pro فقط
     $recentUsers = $pdo->query(
         'SELECT id, name, email, role, is_pro, is_active, created_at FROM users ORDER BY id DESC LIMIT 8'
     )->fetchAll();
 
     json_ok([
+        'total_tenants'   => $totalTenants,
+        'active_tenants'  => $activeTenants,
         'total_users'     => $totalUsers,
         'active_users'    => $activeUsers,
         'pro_users'       => $proUsers,
         'pending_pro_requests' => $pendingPro,
-        'total_invoices'  => $totalInvoices,
-        'total_revenue'   => $totalRevenue,
-        'total_products'  => $totalProducts,
-        'total_customers' => $totalCustomers,
-        'daily_sales'     => $daily,
         'recent_users'    => $recentUsers,
         'server_time'     => date('c'),
     ]);
@@ -76,11 +71,17 @@ if ($action === 'pro') {
 }
 
 if ($action === 'audit') {
-    $rows = $pdo->query(
-        'SELECT id, action, user_email, ip_address, created_at
-         FROM audit_log ORDER BY id DESC LIMIT 50'
-    )->fetchAll();
-    json_ok($rows);
+    // ⚠️ أمان: نعرض فقط سجلات إجراءات المطوّر نفسه على المنصّة (dev_panel_*)
+    // أو محاولات دخول لوحة المطوّر — أبداً أحداث تشغيلية داخل متجر (فواتير/
+    // مبيعات/مخزون) حتى لو ظهرت بصيغة مجمّعة، لأن ذلك يكشف نشاط المتاجر.
+    $rows = $pdo->prepare(
+        "SELECT id, action, user_email, ip_address, created_at
+         FROM audit_log
+         WHERE user_email = 'developer' OR action LIKE 'dev_panel%'
+         ORDER BY id DESC LIMIT 50"
+    );
+    $rows->execute();
+    json_ok($rows->fetchAll());
 }
 
 json_error('إجراء غير معروف', 400);

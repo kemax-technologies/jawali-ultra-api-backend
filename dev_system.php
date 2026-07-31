@@ -20,7 +20,7 @@ try {
         'users', 'branches', 'products', 'customers', 'invoices', 'invoice_items',
         'suppliers', 'purchases', 'expenses', 'credits', 'cash_accounts',
         'cash_transactions', 'assets', 'employees', 'support_tickets',
-        'pro_requests', 'audit_log', 'admin_sessions', 'rate_limits', 'vouchers',
+        'pro_requests', 'audit_log', 'rate_limits', 'vouchers',
     ];
     foreach ($tableNames as $t) {
         try {

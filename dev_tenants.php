@@ -18,17 +18,18 @@ if ($method === 'GET') {
     $action = $_GET['action'] ?? 'list';
 
     if ($action === 'list') {
-        // ✅ إحصائيات ملخّصة لكل متجر: عدد المستخدمين، عدد الفواتير، الإيرادات،
-        // اسم/بريد المالك — كل ذلك عبر LEFT JOIN بسيطة بدون N+1 queries.
+        // ⚠️ أمان (إلزامي): صاحب المنصّة لا يملك أي متجر ولا يجوز أن يرى بياناته
+        // التشغيلية (فواتير/إيرادات/مخزون/عملاء) — دوره يقتصر على إدارة الخطة
+        // (مجانية/Pro) وتفعيل/تعليق المتجر فقط. لذلك تم عمداً حذف
+        // invoices_count/total_revenue/products_count من هذا الاستعلام.
+        // عدد المستخدمين (users_count) هو بيان حسابي إداري فقط، وليس بياناً
+        // تشغيليّاً، لذلك يبقى مسموحاً لضبط الخطة والتراخيص.
         $rows = $pdo->query(
             "SELECT
                 t.id, t.name, t.plan, t.is_active, t.created_at, t.owner_user_id,
                 owner.name  AS owner_name,
                 owner.email AS owner_email,
-                (SELECT COUNT(*) FROM users u WHERE u.tenant_id = t.id) AS users_count,
-                (SELECT COUNT(*) FROM invoices i WHERE i.tenant_id = t.id) AS invoices_count,
-                (SELECT COALESCE(SUM(i.total), 0) FROM invoices i WHERE i.tenant_id = t.id) AS total_revenue,
-                (SELECT COUNT(*) FROM products p WHERE p.tenant_id = t.id) AS products_count
+                (SELECT COUNT(*) FROM users u WHERE u.tenant_id = t.id) AS users_count
              FROM tenants t
              LEFT JOIN users owner ON owner.id = t.owner_user_id
              ORDER BY t.id DESC"
@@ -41,7 +42,8 @@ if ($method === 'GET') {
         if ($tenantId <= 0) json_error('id مطلوب', 400);
 
         $t = $pdo->prepare(
-            "SELECT t.*, owner.name AS owner_name, owner.email AS owner_email
+            "SELECT t.id, t.name, t.plan, t.is_active, t.created_at, t.owner_user_id,
+                    owner.name AS owner_name, owner.email AS owner_email
              FROM tenants t
              LEFT JOIN users owner ON owner.id = t.owner_user_id
              WHERE t.id = ? LIMIT 1"
@@ -50,6 +52,7 @@ if ($method === 'GET') {
         $tenant = $t->fetch();
         if (!$tenant) json_error('المتجر غير موجود', 404);
 
+        // ✅ بيانات حساب فقط (بلا بيانات تشغيلية) — لدعم قرارات Pro/التفعيل حصراً
         $usersStmt = $pdo->prepare(
             'SELECT id, name, email, role, is_active, is_pro, created_at, last_login_at
              FROM users WHERE tenant_id = ? ORDER BY id ASC'
@@ -57,15 +60,12 @@ if ($method === 'GET') {
         $usersStmt->execute([$tenantId]);
         $tenant['users'] = $usersStmt->fetchAll();
 
-        $stats = $pdo->prepare(
-            "SELECT
-                (SELECT COUNT(*) FROM invoices WHERE tenant_id = ?) AS invoices_count,
-                (SELECT COALESCE(SUM(total), 0) FROM invoices WHERE tenant_id = ?) AS total_revenue,
-                (SELECT COUNT(*) FROM products WHERE tenant_id = ?) AS products_count,
-                (SELECT COUNT(*) FROM customers WHERE tenant_id = ?) AS customers_count"
-        );
-        $stats->execute([$tenantId, $tenantId, $tenantId, $tenantId]);
-        $tenant['stats'] = $stats->fetch();
+        // ⚠️ أمان (إلزامي): لا نُرجع أي إحصائيات تشغيلية (فواتير/إيرادات/
+        // منتجات/عملاء) لهذا المتجر — صاحب المنصّة لا صلاحية له على بيانات
+        // تشغيل أي متجر بتاتاً. فقط عدد الحسابات (users_count) كبيان إداري.
+        $tenant['stats'] = [
+            'users_count' => count($tenant['users']),
+        ];
 
         json_ok($tenant);
     }

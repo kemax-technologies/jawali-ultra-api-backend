@@ -67,22 +67,9 @@ switch ($action) {
         // الاستعلام أعلاه) لضمان ظهور حدث تسجيل الدخول في سجل تدقيق متجره.
         audit('تسجيل دخول (' . ($user['role'] ?? '') . ')', $email, 'info', (int)($user['tenant_id'] ?? 0) ?: null);
 
-        // ✅ إبقاء تسجيل admin_sessions القديم لدور "مدير" فقط (توافقية خلفية
-        // مع لوحة الأدمن الويب التي لا تزال تقرأ من هذا الجدول تحديداً) — دور
-        // "المالك" لم يعد موجوداً في النظام؛ صاحب المنصة يُدار من لوحة المطوّر فقط.
-        if (($user['role'] ?? '') === 'مدير') {
-            try {
-                db()->prepare(
-                    'INSERT INTO admin_sessions (user_email, token_hash, ip_address, user_agent, expires_at)
-                     VALUES (?, ?, ?, ?, NOW() + INTERVAL \'7 days\')'
-                )->execute([
-                    $email,
-                    hash('sha256', $token),
-                    $ip,
-                    substr($_SERVER['HTTP_USER_AGENT'] ?? '', 0, 240),
-                ]);
-            } catch (Exception $e) { /* الجدول قد لا يكون موجوداً بعد — تجاهل بأمان */ }
-        }
+        // ✅ تم حذف admin_web بالكامل من النظام — لم يعد هناك أي تسجيل في
+        // admin_sessions هنا. تتبّع الجلسات لكل الأدوار يتم فقط عبر
+        // user_sessions (انظر log_user_session أعلاه).
 
         $permissions = effective_permissions((string)($user['role'] ?? ''), $user['permissions'] ?? null);
 
