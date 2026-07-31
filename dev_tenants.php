@@ -108,13 +108,71 @@ if ($method === 'POST') {
         case 'delete': {
             // ⚠️ حذف متجر كامل مع كل بياناته (مستخدمين، فواتير، منتجات...) —
             // إجراء لا يمكن التراجع عنه، مقيَّد لحماية المتاجر الأساسية.
+            //
+            // ✅ إصلاح حرج: جميع قيود المفاتيح الأجنبية (Foreign Keys) المرتبطة
+            // بـ tenant_id في قاعدة البيانات معرَّفة بـ "ON DELETE NO ACTION"
+            // (لا CASCADE) — أي أن حذف صف "tenants" مباشرةً (كما كان الكود
+            // القديم يفعل) كان يفشل دائماً بمجرد وجود صف واحد مرتبط في أي من
+            // ~30 جدولاً تابعاً (فواتير، منتجات، عملاء...)، مما يجعل ميزة حذف
+            // متجر مُعطَّلة فعلياً لأي متجر نشط بالفعل. الحل: حذف كل الجداول
+            // التابعة يدوياً بترتيب يحترم تسلسل المفاتيح الأجنبية بينها (من
+            // الأبعد اعتماداً إلى الأقرب)، ثم المستخدمين، ثم المتجر نفسه.
             if ($tenantId === 1) json_error('لا يمكن حذف المتجر الرئيسي', 400);
             try {
                 $pdo->beginTransaction();
+
                 // فكّ الحلقة الدائرية (tenants.owner_user_id <-> users.tenant_id)
                 // قبل الحذف الفعلي لتجنّب انتهاك قيود FK.
                 $pdo->prepare('UPDATE tenants SET owner_user_id = NULL WHERE id = ?')->execute([$tenantId]);
+
+                // فكّ الحلقة الذاتية في شجرة الحسابات (parent_id يشير لنفس الجدول)
+                $pdo->prepare('UPDATE chart_of_accounts SET parent_id = NULL WHERE tenant_id = ?')->execute([$tenantId]);
+
+                // ترتيب الحذف: الجداول "الأعمق" (التي تعتمد على غيرها بمفاتيح
+                // أجنبية NO ACTION) أولاً، ثم الجداول التي تعتمد عليها، وأخيراً
+                // المستخدمون والمتجر نفسه.
+                $tablesInOrder = [
+                    'journal_entry_lines',   // entry_id → journal_entries, account_id → chart_of_accounts
+                    'money_transfers',       // cash_account_id / payout_cash_account_id → cash_accounts
+                    'payroll_runs',          // employee_id → employees, cash_account_id → cash_accounts
+                    'vouchers',              // cash_account_id → cash_accounts
+                    'cash_transactions',     // account_id → cash_accounts (CASCADE أصلاً، لكن نحذفها صريحاً للأمان)
+                    'credit_payments',       // credit_id → credits (CASCADE أصلاً)
+                    'invoice_items',         // invoice_id → invoices (CASCADE أصلاً)
+                    'invoices',              // warehouse_id / cash_account_id → warehouses / cash_accounts
+                    'warehouse_transfers',   // from/to_warehouse_id → warehouses
+                    'warehouse_stock',       // warehouse_id → warehouses
+                    'journal_entries',       // (بعد حذف journal_entry_lines التابعة لها)
+                    'chart_of_accounts',     // (بعد فكّ parent_id أعلاه)
+                    'employees',             // (بعد حذف payroll_runs التابعة لها)
+                    'cash_accounts',         // (بعد حذف كل ما يشير إليها أعلاه)
+                    'warehouses',            // (بعد حذف كل ما يشير إليها أعلاه)
+                    'credits',               // (بعد حذف credit_payments التابعة لها)
+                    'pro_requests',
+                    'products',
+                    'customers',
+                    'suppliers',
+                    'purchases',
+                    'purchase_returns',
+                    'quotations',
+                    'returns',
+                    'expenses',
+                    'assets',
+                    'scanner_codes',
+                    'scanner_sessions',
+                    'settings',
+                    'branches',
+                    'audit_log',
+                ];
+                foreach ($tablesInOrder as $table) {
+                    $pdo->prepare("DELETE FROM {$table} WHERE tenant_id = ?")->execute([$tenantId]);
+                }
+
+                // المستخدمون أخيراً (يُلغي تلقائياً عبر CASCADE: password_reset_tokens،
+                // support_tickets ← support_messages، user_social_links، pro_requests
+                // إن وُجدت أي بقايا مرتبطة بمستخدمين هذا المتجر تحديداً)
                 $pdo->prepare('DELETE FROM users WHERE tenant_id = ?')->execute([$tenantId]);
+
                 $pdo->prepare('DELETE FROM tenants WHERE id = ?')->execute([$tenantId]);
                 $pdo->commit();
             } catch (Exception $e) {

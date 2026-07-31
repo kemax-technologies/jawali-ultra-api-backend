@@ -7,8 +7,14 @@
  * تدفّق العمل:
  *   1) المستخدم يحوّل المبلغ إلى حساب بنكي، ثم يرسل رقم/مرجع التحويل من داخل
  *      التطبيق → ينشئ طلب ترقية بحالة "pending" (لا يُفعَّل شيء تلقائياً).
- *   2) المدير (صلاحية "مدير" في نفس النظام) يراجع الطلب من لوحة التحكم
- *      داخل التطبيق، ثم يوافق أو يرفض.
+ *   2) 🔒 مراجعة الطلب (موافقة/رفض/إلغاء) هي صلاحية حصرية لمطوّر التطبيق فقط
+ *      عبر لوحة تحكم منفصلة تماماً (dev_pro.php + dev_require_auth()) —
+ *      مدير المتجر ("مدير") لا يملك ولا يجب أن يملك صلاحية الموافقة على
+ *      طلبات الترقية المدفوعة، لأن هذه صلاحية على مستوى المنصّة (Platform-
+ *      level)، وليست على مستوى المتجر (Tenant-level). لذلك الإجراءات أدناه
+ *      (list/approve/reject/revoke) محظورة صراحةً على "مدير" وتتطلب توكن
+ *      المطوّر (dev_require_auth عبر Authorization: Bearer <dev_token>) —
+ *      انظر pro_deny_store_admin() أدناه.
  *   3) عند الموافقة: يُفعَّل الحساب فعلياً في قاعدة البيانات (is_pro=1) مع
  *      تاريخ انتهاء حسب الخطة (سنوية = 365 يوم، شهرية = 30 يوم).
  *   4) التطبيق يتحقق من حالة Pro دائماً من الخادم (لا يعتمد على تخزين محلي) —
@@ -17,10 +23,10 @@
  * Endpoints:
  *   POST /pro.php?action=request   — إنشاء طلب ترقية جديد (يتطلب تسجيل دخول)
  *   GET  /pro.php?action=status    — حالة Pro الحالية للمستخدم + آخر طلب
- *   GET  /pro.php?action=list      — قائمة كل الطلبات (مدير فقط)
- *   POST /pro.php?action=approve   — الموافقة على طلب (مدير فقط)
- *   POST /pro.php?action=reject    — رفض طلب (مدير فقط)
- *   POST /pro.php?action=revoke    — إلغاء تفعيل Pro عن مستخدم (مدير فقط)
+ *   GET  /pro.php?action=list      — 🔒 مطوّر التطبيق فقط (dev_pro.php/dev_stats.php)
+ *   POST /pro.php?action=approve   — 🔒 مطوّر التطبيق فقط (dev_pro.php)
+ *   POST /pro.php?action=reject    — 🔒 مطوّر التطبيق فقط (dev_pro.php)
+ *   POST /pro.php?action=revoke    — 🔒 مطوّر التطبيق فقط (dev_users.php)
  */
 
 require_once __DIR__ . '/_db.php';
@@ -30,6 +36,18 @@ require_once __DIR__ . '/_pro_helpers.php';
 $action = $_GET['action'] ?? '';
 $method = $_SERVER['REQUEST_METHOD'];
 $pdo    = db();
+
+// 🔒 حجب صريح: إدارة طلبات Pro (عرض/موافقة/رفض/إلغاء) ليست من صلاحية مدير
+// المتجر ("مدير") — هذه صلاحية منصّة (Platform-level) حصرية لمطوّر التطبيق
+// عبر لوحة تحكم منفصلة تماماً (dev_pro.php + dev_stats.php + dev_users.php
+// بمصادقة dev_require_auth()). حتى لو امتلك مدير متجر توكن "مدير" صالحاً،
+// يُرفض الطلب هنا فوراً (403) بدل تفويضه عبر require_admin() كما كان سابقاً.
+function pro_deny_store_admin(): void {
+    json_error(
+        'هذا الإجراء متاح فقط عبر لوحة تحكم مطوّر التطبيق — ليس من صلاحية مدير المتجر',
+        403
+    );
+}
 
 // ── تحديث تلقائي: تنزيل حالة Pro عند انتهاء الصلاحية ─────────────────────────
 function pro_autoexpire(PDO $pdo, int $userId): array {
@@ -150,28 +168,11 @@ switch ($action) {
     }
 
     // ═════════════════════════════════════════════════════════════════════════
-    // GET — قائمة كل الطلبات (لوحة تحكم المدير)
+    // GET — قائمة كل الطلبات — 🔒 محظور على مدير المتجر (انظر dev_stats.php)
     // ═════════════════════════════════════════════════════════════════════════
     case 'list': {
-        $admin = require_admin();
-        $tenantId = tenant_id_from_auth($admin);
-        $statusFilter = $_GET['status'] ?? '';
-        if ($statusFilter !== '' && in_array($statusFilter, ['pending', 'approved', 'rejected'], true)) {
-            $stmt = $pdo->prepare(
-                'SELECT pr.*, u.name AS user_name
-                 FROM pro_requests pr JOIN users u ON u.id = pr.user_id
-                 WHERE pr.status = ? AND pr.tenant_id = ? ORDER BY pr.id DESC'
-            );
-            $stmt->execute([$statusFilter, $tenantId]);
-        } else {
-            $stmt = $pdo->prepare(
-                'SELECT pr.*, u.name AS user_name
-                 FROM pro_requests pr JOIN users u ON u.id = pr.user_id
-                 WHERE pr.tenant_id = ? ORDER BY pr.id DESC LIMIT 200'
-            );
-            $stmt->execute([$tenantId]);
-        }
-        json_ok(['success' => true, 'requests' => $stmt->fetchAll()]);
+        // 🔒 صلاحية مطوّر التطبيق حصرياً — استخدم dev_stats.php?action=pro
+        pro_deny_store_admin();
         break;
     }
 
@@ -179,23 +180,8 @@ switch ($action) {
     // POST — الموافقة على طلب (تفعيل حقيقي لحساب المستخدم)
     // ═════════════════════════════════════════════════════════════════════════
     case 'approve': {
-        if ($method !== 'POST') json_error('استخدم POST', 405);
-        $admin = require_admin();
-        $tenantId = tenant_id_from_auth($admin);
-        $body = input_json();
-        $requestId = (int)($body['request_id'] ?? 0);
-        if ($requestId <= 0) json_error('request_id مطلوب');
-
-        // ✅ تحسين: منطق الموافقة موحّد الآن في _pro_helpers.php ويُستخدم من
-        //    pro.php و dev_pro.php لمنع انحراف التنفيذ بين لوحتي التحكم.
-        // ✅ Multi-Tenant: تمرير $tenantId يقيّد الموافقة بطلبات متجر المدير
-        //    الحالي فقط — لا يمكن لمدير متجر الموافقة على طلب متجر آخر.
-        $result = pro_approve_request($pdo, $requestId, $admin['email'] ?? '', $tenantId);
-        $req = $result['request'];
-        $expiresAt = $result['expires_at'];
-
-        audit("تفعيل Pro للمستخدم {$req['user_email']} (خطة {$req['plan']})", $admin['email'] ?? null, 'info', $tenantId);
-        json_ok(['success' => true, 'message' => 'تم تفعيل الحساب Pro بنجاح', 'expires_at' => $expiresAt]);
+        // 🔒 صلاحية مطوّر التطبيق حصرياً — استخدم dev_pro.php
+        pro_deny_store_admin();
         break;
     }
 
@@ -203,18 +189,8 @@ switch ($action) {
     // POST — رفض طلب
     // ═════════════════════════════════════════════════════════════════════════
     case 'reject': {
-        if ($method !== 'POST') json_error('استخدم POST', 405);
-        $admin = require_admin();
-        $tenantId = tenant_id_from_auth($admin);
-        $body = input_json();
-        $requestId = (int)($body['request_id'] ?? 0);
-        $reason = trim((string)($body['reason'] ?? 'لم يتم تأكيد التحويل'));
-        if ($requestId <= 0) json_error('request_id مطلوب');
-
-        $req = pro_reject_request($pdo, $requestId, $admin['email'] ?? '', $reason, $tenantId);
-
-        audit("رفض طلب ترقية Pro للمستخدم {$req['user_email']}", $admin['email'] ?? null, 'info', $tenantId);
-        json_ok(['success' => true, 'message' => 'تم رفض الطلب']);
+        // 🔒 صلاحية مطوّر التطبيق حصرياً — استخدم dev_pro.php
+        pro_deny_store_admin();
         break;
     }
 
@@ -222,22 +198,8 @@ switch ($action) {
     // POST — إلغاء تفعيل Pro عن مستخدم (مثلاً بعد انتهاء اتفاق أو استرجاع مبلغ)
     // ═════════════════════════════════════════════════════════════════════════
     case 'revoke': {
-        if ($method !== 'POST') json_error('استخدم POST', 405);
-        $admin = require_admin();
-        $tenantId = tenant_id_from_auth($admin);
-        $body = input_json();
-        $email = strtolower(trim((string)($body['email'] ?? '')));
-        if ($email === '') json_error('email مطلوب');
-
-        // ✅ Multi-Tenant: مدير متجر لا يمكنه إلغاء تفعيل Pro لمستخدم في متجر آخر.
-        $stmt = $pdo->prepare('UPDATE users SET is_pro = 0 WHERE email = ? AND tenant_id = ?');
-        $stmt->execute([$email, $tenantId]);
-        if ($stmt->rowCount() === 0) {
-            json_error('المستخدم غير موجود في متجرك', 404);
-        }
-
-        audit("إلغاء تفعيل Pro للمستخدم $email", $admin['email'] ?? null, 'info', $tenantId);
-        json_ok(['success' => true, 'message' => 'تم إلغاء التفعيل']);
+        // 🔒 صلاحية مطوّر التطبيق حصرياً — استخدم dev_users.php?action=revoke_pro
+        pro_deny_store_admin();
         break;
     }
 

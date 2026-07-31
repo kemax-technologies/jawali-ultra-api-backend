@@ -46,6 +46,13 @@ if ($method === 'POST') {
     $ticketId = (int)($b['ticket_id'] ?? 0);
     if ($ticketId <= 0) json_error('ticket_id مطلوب');
 
+    // ✅ إصلاح: جلب tenant_id الخاص بالتذكرة المستهدفة مرة واحدة — يُستخدم
+    // في تسجيل audit بمتجرها الصحيح لكل من 'reply' و 'update' أدناه.
+    $ticketTenantRow = $pdo->prepare('SELECT tenant_id FROM support_tickets WHERE id = ?');
+    $ticketTenantRow->execute([$ticketId]);
+    $ticketTenantId = $ticketTenantRow->fetchColumn();
+    $ticketTenantId = $ticketTenantId !== false ? ((int)$ticketTenantId ?: null) : null;
+
     if ($action === 'reply') {
         $message = trim((string)($b['message'] ?? ''));
         if ($message === '') json_error('نص الرد مطلوب');
@@ -65,7 +72,7 @@ if ($method === 'POST') {
             json_error('تعذّر إرسال الرد', 500);
         }
 
-        audit("dev_panel: رد على تذكرة دعم #$ticketId", 'developer');
+        audit("dev_panel: رد على تذكرة دعم #$ticketId", 'developer', 'info', $ticketTenantId);
         json_ok(['success' => true]);
     }
 
@@ -86,7 +93,7 @@ if ($method === 'POST') {
         $params[] = $ticketId;
         $pdo->prepare('UPDATE support_tickets SET ' . implode(', ', $sets) . ' WHERE id = ?')->execute($params);
 
-        audit("dev_panel: تحديث تذكرة دعم #$ticketId", 'developer');
+        audit("dev_panel: تحديث تذكرة دعم #$ticketId", 'developer', 'info', $ticketTenantId);
         json_ok(['success' => true]);
     }
 }

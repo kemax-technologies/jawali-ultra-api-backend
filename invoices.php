@@ -145,8 +145,8 @@ switch ($method) {
             // تحديث بنود الفاتورة وخصم المخزون (المخزون العام + مخزون المخزن المحدد إن وُجد)
             // ✅ Multi-Tenant: كل تحديث على products/warehouse_stock مقيّد بـ tenant_id
             // لأن sku لم يعد فريداً إلا ضمن نطاق المتجر الواحد (tenant_id, sku)
-            $pdo->prepare('DELETE FROM invoice_items WHERE invoice_id = ?')->execute([$id]);
-            $insItem  = $pdo->prepare('INSERT INTO invoice_items (invoice_id, product_sku, name, price, qty, line_total, unit_type, unit_label, pack_factor, base_qty) VALUES (?,?,?,?,?,?,?,?,?,?)');
+            $pdo->prepare('DELETE FROM invoice_items WHERE invoice_id = ? AND tenant_id = ?')->execute([$id, $tenantId]);
+            $insItem  = $pdo->prepare('INSERT INTO invoice_items (invoice_id, tenant_id, product_sku, name, price, qty, line_total, unit_type, unit_label, pack_factor, base_qty) VALUES (?,?,?,?,?,?,?,?,?,?,?)');
             $decStock = $pdo->prepare('UPDATE products SET stock = GREATEST(0, stock - ?), sold = sold + ? WHERE tenant_id = ? AND sku = ?');
             $decWhStock = $pdo->prepare(
                 'UPDATE warehouse_stock SET stock = GREATEST(0, stock - ?) WHERE tenant_id = ? AND warehouse_id = ? AND product_sku = ?'
@@ -158,7 +158,7 @@ switch ($method) {
                 $qty      = (int)  ($it['qty']   ?? 1);
                 $baseQty  = (int)  ($it['base_qty'] ?? $it['baseQty'] ?? $qty);
                 $insItem->execute([
-                    $id, $sku, $name, $price, $qty, $price * $qty,
+                    $id, $tenantId, $sku, $name, $price, $qty, $price * $qty,
                     $it['unit_type']   ?? 'piece',
                     $it['unit_label']  ?? 'قطعة',
                     (int)($it['pack_factor'] ?? 1),
@@ -199,7 +199,7 @@ switch ($method) {
             error_log('[Jawali][invoices] فشل حفظ الفاتورة: ' . $e->getMessage());
             json_error('خطأ داخلي في الخادم', 500);
         }
-        audit("invoice $id");
+        audit("invoice $id", $auth['email'] ?? null, 'info', $tenantId);
         json_ok(['success' => true, 'id' => $id]);
         break;
     }
@@ -258,8 +258,8 @@ function _reverse_invoice_effects(PDO $pdo, array $inv, ?string $byEmail, int $t
 
     // استرجاع الكميات إلى المخزون (العام + مخزن محدد إن وُجد)
     // ✅ Multi-Tenant: كل تحديث مقيّد بـ tenant_id لأن sku فريد فقط ضمن المتجر
-    $itemsStmt = $pdo->prepare('SELECT product_sku, base_qty, qty FROM invoice_items WHERE invoice_id = ?');
-    $itemsStmt->execute([$id]);
+    $itemsStmt = $pdo->prepare('SELECT product_sku, base_qty, qty FROM invoice_items WHERE invoice_id = ? AND tenant_id = ?');
+    $itemsStmt->execute([$id, $tenantId]);
     $incStock   = $pdo->prepare('UPDATE products SET stock = stock + ?, sold = GREATEST(0, sold - ?) WHERE tenant_id = ? AND sku = ?');
     $incWhStock = $pdo->prepare('UPDATE warehouse_stock SET stock = stock + ? WHERE tenant_id = ? AND warehouse_id = ? AND product_sku = ?');
     foreach ($itemsStmt->fetchAll() as $it) {

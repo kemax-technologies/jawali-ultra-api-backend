@@ -7,16 +7,22 @@
  * تدفّق العمل:
  *   1) أي مستخدم مسجّل يمكنه فتح تذكرة دعم (موضوع + رسالة أولى).
  *   2) مستخدمو Pro يحصلون تلقائياً على أولوية أعلى (priority = 'high')
- *      وتُعلَّم تذكرتهم is_pro_ticket = 1 لتظهر أولاً للإدارة.
- *   3) المدير (صلاحية "مدير") يرى كل التذاكر ويمكنه الرد أو تغيير الحالة/الأولوية.
- *   4) المستخدم يرى فقط تذاكره الخاصة ومحادثاتها.
+ *      وتُعلَّم تذكرتهم is_pro_ticket = 1 لتظهر أولاً لمطوّر التطبيق.
+ *   3) 🔒 إدارة كل تذاكر الدعم (عرض تذاكر الجميع، الرد كإدارة، تغيير الحالة/
+ *      الأولوية، الإغلاق) هي صلاحية حصرية لمطوّر التطبيق فقط عبر لوحة تحكم
+ *      منفصلة تماماً (dev_support.php + dev_require_auth()). صلاحية "مدير"
+ *      داخل المتجر لا تمنح أي وصول إداري لتذاكر الدعم — هذه صلاحية منصّة
+ *      (Platform-level)، وليست صلاحية متجر (Tenant-level). لذلك
+ *      support_is_admin() أدناه مُعطَّلة عمداً (ترجع false دائماً) لضمان أن
+ *      كل مستخدم — بما فيهم "مدير" — يرى فقط تذاكره الخاصة عبر هذا الملف.
+ *   4) المستخدم (أي دور) يرى فقط تذاكره الخاصة ومحادثاتها عبر هذا الملف.
  *
  * Endpoints:
  *   POST /support.php?action=create   — فتح تذكرة جديدة (تسجيل دخول مطلوب)
- *   GET  /support.php?action=list     — تذاكر المستخدم (أو الكل إن كان مديراً)
- *   GET  /support.php?action=messages&ticket_id=X — محادثة تذكرة
- *   POST /support.php?action=reply    — إضافة رد على تذكرة
- *   POST /support.php?action=update   — تغيير حالة/أولوية تذكرة (مدير فقط)
+ *   GET  /support.php?action=list     — تذاكر المستخدم الحالي فقط (لا يوجد عرض إداري هنا)
+ *   GET  /support.php?action=messages&ticket_id=X — محادثة تذكرة (تخص المستخدم الحالي فقط)
+ *   POST /support.php?action=reply    — إضافة رد من المستخدم على تذكرته الخاصة
+ *   POST /support.php?action=update   — 🔒 محظور — مطوّر التطبيق فقط (dev_support.php)
  */
 
 require_once __DIR__ . '/_db.php';
@@ -72,11 +78,16 @@ function support_ensure_tables(): void {
 }
 support_ensure_tables();
 
+// 🔒 مُعطَّلة عمداً: إدارة تذاكر الدعم (رؤية الكل + الرد كإدارة + الإغلاق) هي
+// صلاحية منصّة حصرية لمطوّر التطبيق عبر dev_support.php فقط — وليست صلاحية
+// "مدير" المتجر مهما كان دوره. لذلك هذه الدالة ترجع false دائماً هنا، مما
+// يضمن أن كل طلب عبر support.php (بما فيه من لديه دور "مدير") يُعامَل كمستخدم
+// عادي يرى فقط تذاكره الخاصة. لا تُعِد تفعيلها لربط هذا الملف بصلاحية "مدير".
 function support_is_admin(array $auth): bool {
-    return ($auth['role'] ?? '') === 'مدير';
+    return false;
 }
 
-/** يتأكد أن التذكرة تخص المستخدم الحالي أو أنه مدير في نفس المتجر — يرجع سجل التذكرة أو ينهي بخطأ */
+/** يتأكد أن التذكرة تخص المستخدم الحالي (support_is_admin دائماً false هنا) — يرجع سجل التذكرة أو ينهي بخطأ */
 function support_load_ticket_for(PDO $pdo, int $ticketId, array $auth, int $tenantId): array {
     $stmt = $pdo->prepare('SELECT * FROM support_tickets WHERE id = ? AND tenant_id = ?');
     $stmt->execute([$ticketId, $tenantId]);
@@ -152,33 +163,18 @@ switch ($action) {
     }
 
     // ═════════════════════════════════════════════════════════════════════════
-    // GET — قائمة التذاكر (المستخدم يرى تذاكره فقط، المدير يرى الكل)
+    // GET — قائمة التذاكر (يرى المستخدم تذاكره الخاصة فقط دائماً — لا يوجد
+    // عرض إداري لكل التذاكر هنا مهما كان دور المستخدم؛ ذلك حصراً عبر
+    // dev_support.php لمطوّر التطبيق)
     // ═════════════════════════════════════════════════════════════════════════
     case 'list': {
         $auth     = require_auth();
         $tenantId = tenant_id_from_auth($auth);
 
-        if (support_is_admin($auth)) {
-            $statusFilter = $_GET['status'] ?? '';
-            if ($statusFilter !== '' && in_array($statusFilter, ['open', 'answered', 'closed'], true)) {
-                $stmt = $pdo->prepare(
-                    'SELECT * FROM support_tickets WHERE status = ? AND tenant_id = ?
-                     ORDER BY is_pro_ticket DESC, id DESC LIMIT 300'
-                );
-                $stmt->execute([$statusFilter, $tenantId]);
-            } else {
-                $stmt = $pdo->prepare(
-                    'SELECT * FROM support_tickets WHERE tenant_id = ?
-                     ORDER BY is_pro_ticket DESC, id DESC LIMIT 300'
-                );
-                $stmt->execute([$tenantId]);
-            }
-        } else {
-            $stmt = $pdo->prepare(
-                'SELECT * FROM support_tickets WHERE user_id = ? AND tenant_id = ? ORDER BY id DESC LIMIT 200'
-            );
-            $stmt->execute([(int)$auth['sub'], $tenantId]);
-        }
+        $stmt = $pdo->prepare(
+            'SELECT * FROM support_tickets WHERE user_id = ? AND tenant_id = ? ORDER BY id DESC LIMIT 200'
+        );
+        $stmt->execute([(int)$auth['sub'], $tenantId]);
 
         json_ok(['success' => true, 'tickets' => $stmt->fetchAll()]);
         break;
@@ -268,40 +264,14 @@ switch ($action) {
     }
 
     // ═════════════════════════════════════════════════════════════════════════
-    // POST — تحديث حالة/أولوية تذكرة (مدير فقط) — مثل الإغلاق
+    // POST — تحديث حالة/أولوية تذكرة — 🔒 محظور، صلاحية مطوّر التطبيق حصرياً
+    // (استخدم dev_support.php?action=update) — ليست من صلاحية مدير المتجر.
     // ═════════════════════════════════════════════════════════════════════════
     case 'update': {
-        if ($method !== 'POST') json_error('استخدم POST', 405);
-        $admin    = require_admin();
-        $tenantId = tenant_id_from_auth($admin);
-        $body = input_json();
-        $ticketId = (int)($body['ticket_id'] ?? 0);
-        if ($ticketId <= 0) json_error('ticket_id مطلوب');
-
-        $stmt = $pdo->prepare('SELECT id FROM support_tickets WHERE id = ? AND tenant_id = ?');
-        $stmt->execute([$ticketId, $tenantId]);
-        if (!$stmt->fetch()) json_error('التذكرة غير موجودة في متجرك', 404);
-
-        $fields = [];
-        $values = [];
-        if (isset($body['status']) && in_array($body['status'], ['open', 'answered', 'closed'], true)) {
-            $fields[] = 'status = ?';
-            $values[] = $body['status'];
-        }
-        if (isset($body['priority']) && in_array($body['priority'], ['normal', 'high', 'urgent'], true)) {
-            $fields[] = 'priority = ?';
-            $values[] = $body['priority'];
-        }
-        if (empty($fields)) json_error('لا توجد تغييرات صالحة لتطبيقها');
-
-        $fields[] = 'updated_at = now()';
-        $values[] = $ticketId;
-        $values[] = $tenantId;
-        $pdo->prepare('UPDATE support_tickets SET ' . implode(', ', $fields) . ' WHERE id = ? AND tenant_id = ?')
-            ->execute($values);
-
-        audit("تحديث تذكرة دعم #$ticketId", $admin['email'] ?? null, 'info', $tenantId);
-        json_ok(['success' => true, 'message' => 'تم التحديث']);
+        json_error(
+            'هذا الإجراء متاح فقط عبر لوحة تحكم مطوّر التطبيق — ليس من صلاحية مدير المتجر',
+            403
+        );
         break;
     }
 

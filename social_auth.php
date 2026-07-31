@@ -433,7 +433,7 @@ switch ($action) {
 
         if (!$user['is_active']) json_error('الحساب موقوف. تواصل مع المسؤول.', 403);
 
-        audit('تسجيل دخول عبر الهاتف', $phone);
+        audit('تسجيل دخول عبر الهاتف', $phone, 'info', (int)($user['tenant_id'] ?? 0) ?: null);
         json_ok(issue_session_for_user($user));
         break;
 

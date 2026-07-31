@@ -34,7 +34,9 @@ switch ($action) {
         $req = $result['request'];
         $expiresAt = $result['expires_at'];
 
-        audit("dev_panel: تفعيل Pro للمستخدم {$req['user_email']} (خطة {$req['plan']})", 'developer');
+        // ✅ إصلاح: تمرير tenant_id الخاص بالطلب (متوفر ضمن $req عبر SELECT *)
+        // لضمان ظهور حدث التفعيل في سجل تدقيق المتجر المعني، لا بلا متجر.
+        audit("dev_panel: تفعيل Pro للمستخدم {$req['user_email']} (خطة {$req['plan']})", 'developer', 'info', (int)($req['tenant_id'] ?? 0) ?: null);
         json_ok(['success' => true, 'message' => 'تم تفعيل الحساب Pro بنجاح', 'expires_at' => $expiresAt]);
         break;
     }
@@ -43,7 +45,8 @@ switch ($action) {
         $reason = trim((string)($b['reason'] ?? 'لم يتم تأكيد التحويل'));
         $req = pro_reject_request($pdo, $requestId, 'developer', $reason);
 
-        audit("dev_panel: رفض طلب ترقية Pro للمستخدم {$req['user_email']}", 'developer');
+        // ✅ إصلاح: نفس منطق التفعيل أعلاه — تمرير tenant_id الخاص بالطلب.
+        audit("dev_panel: رفض طلب ترقية Pro للمستخدم {$req['user_email']}", 'developer', 'info', (int)($req['tenant_id'] ?? 0) ?: null);
         json_ok(['success' => true, 'message' => 'تم رفض الطلب']);
         break;
     }
