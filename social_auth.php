@@ -13,6 +13,14 @@
 require_once __DIR__ . '/_db.php';
 require_once __DIR__ . '/_rate_limit.php';
 
+// ─────────────────────────────────────────────────────────────────────────────
+// ✅ Task 5 — إغلاق ثغرة تجاوز 2FA عبر تسجيل الدخول الاجتماعي: قبل هذا
+// الإصلاح كان هذا الملف يُصدر JWT كامل الصلاحيات مباشرة بعد نجاح مزوّد
+// Google/Apple/OTP فقط، متجاهلاً تماماً أن الحساب قد يكون فعَّل 2FA مسبقاً
+// عبر تسجيل الدخول بكلمة المرور (auth.php). tfa_gate() و issue_session_for_user()
+// أدناه يُطبّقان الآن نفس بوّابة 2FA المستخدمة في auth.php لكل مسارات الدخول.
+// ─────────────────────────────────────────────────────────────────────────────
+
 $action = $_GET['action'] ?? '';
 $method = $_SERVER['REQUEST_METHOD'];
 
@@ -167,6 +175,10 @@ function issue_session_for_user(array $user): array {
         'email' => $user['email'],
         'role'  => $user['role'],
     ]);
+    // ✅ Task 5: يُطابق شكل استجابة issue_full_session() في auth.php لضمان
+    // أن AppUser.fromMap في Flutter يقرأ tenant_id/permissions/tfa_enabled
+    // بشكل صحيح بغضّ النظر عن مسار الدخول (محلي أو اجتماعي).
+    $permissions = effective_permissions((string)($user['role'] ?? ''), $user['permissions'] ?? null);
     return [
         'success' => true,
         'token'   => $token,
@@ -178,6 +190,9 @@ function issue_session_for_user(array $user): array {
             'role'        => $user['role'],
             'avatar_url'  => $user['avatar_url'] ?? null,
             'auth_provider' => $user['auth_provider'] ?? 'local',
+            'permissions' => $permissions,
+            'tenant_id'   => isset($user['tenant_id']) ? (int)$user['tenant_id'] : null,
+            'tfa_enabled' => !empty($user['tfa_enabled']),
         ],
     ];
 }
@@ -298,6 +313,9 @@ switch ($action) {
 
         $user = find_or_create_social_user('google', $info);
         if (!$user['is_active']) json_error('الحساب موقوف. تواصل مع المسؤول.', 403);
+        // ✅ Task 5 — بوّابة 2FA الموحّدة (راجع تعريفها في _db.php)
+        $tfaResp = tfa_gate($user);
+        if ($tfaResp !== null) json_ok($tfaResp);
         json_ok(issue_session_for_user($user));
         break;
 
@@ -320,6 +338,9 @@ switch ($action) {
 
         $user = find_or_create_social_user('apple', $info);
         if (!$user['is_active']) json_error('الحساب موقوف. تواصل مع المسؤول.', 403);
+        // ✅ Task 5 — بوّابة 2FA الموحّدة
+        $tfaResp = tfa_gate($user);
+        if ($tfaResp !== null) json_ok($tfaResp);
         json_ok(issue_session_for_user($user));
         break;
 
@@ -434,6 +455,9 @@ switch ($action) {
         if (!$user['is_active']) json_error('الحساب موقوف. تواصل مع المسؤول.', 403);
 
         audit('تسجيل دخول عبر الهاتف', $phone, 'info', (int)($user['tenant_id'] ?? 0) ?: null);
+        // ✅ Task 5 — بوّابة 2FA الموحّدة (تنطبق أيضاً على الدخول عبر الهاتف)
+        $tfaResp = tfa_gate($user);
+        if ($tfaResp !== null) json_ok($tfaResp);
         json_ok(issue_session_for_user($user));
         break;
 

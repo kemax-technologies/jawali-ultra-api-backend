@@ -436,6 +436,54 @@ function audit(string $action, ?string $email = null, string $level = 'info', ?i
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// ✅ Task 5 — بوّابة 2FA على مستوى الخادم، مشتركة بين auth.php (دخول محلي
+// بالبريد/كلمة المرور) و social_auth.php (Google/Apple/الهاتف). قبل هذا
+// التوحيد، كان تسجيل الدخول الاجتماعي يُصدر JWT كامل الصلاحيات مباشرة بعد
+// نجاح مزوّد Google/Apple/OTP فقط، متجاهلاً تماماً أن الحساب قد يكون فعَّل
+// 2FA مسبقاً عبر تسجيل الدخول بكلمة المرور — أي ثغرة تجاوز كاملة لحماية 2FA
+// عبر تسجيل الدخول الاجتماعي. الآن: أي مسار دخول (محلي أو اجتماعي) يُستدعي
+// نفس هذه البوّابة قبل إصدار أي جلسة حقيقية.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ينشئ سجل "دخول معلَّق" بانتظار رمز 2FA — رمز عشوائي (32 بايت) صالح 5 دقائق
+// فقط، ولا صلاحية له مطلقاً لاستدعاء أي endpoint آخر (ليس JWT، لا يُقبل في
+// require_auth()) — الاستخدام الوحيد الممكن له هو auth.php?action=verify_2fa.
+function create_tfa_pending_token(int $userId): string {
+    // تنظيف السجلات المنتهية بشكل عرضي (best-effort) — الجدول صغير جداً
+    try { db()->exec('DELETE FROM tfa_pending_logins WHERE expires_at < NOW()'); } catch (Exception $e) { /* تجاهل */ }
+
+    $raw  = bin2hex(random_bytes(32));
+    $hash = hash('sha256', $raw);
+    $ip   = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+    db()->prepare(
+        'INSERT INTO tfa_pending_logins (user_id, token_hash, ip_address, expires_at)
+         VALUES (?, ?, ?, NOW() + INTERVAL \'5 minutes\')'
+    )->execute([$userId, $hash, $ip]);
+    return $raw;
+}
+
+// بوّابة موحّدة: تُعيد null إن كان 2FA غير مفعَّل لهذا الحساب (يُكمل المستدعي
+// إصدار الجلسة الكاملة كالمعتاد)، أو Map جاهزة لإرسالها مباشرة عبر json_ok()
+// إن كان 2FA مفعَّلاً (tfa_required=true + رمز دخول معلَّق) — بغضّ النظر عن
+// طريقة الدخول الأولى (كلمة مرور / Google / Apple / هاتف).
+function tfa_gate(array $user): ?array {
+    if (empty($user['tfa_enabled'])) return null;
+    $pendingToken = create_tfa_pending_token((int)$user['id']);
+    audit(
+        'تسجيل دخول (بيانات صحيحة) — بانتظار رمز 2FA',
+        $user['email'] ?? null,
+        'info',
+        (int)($user['tenant_id'] ?? 0) ?: null
+    );
+    return [
+        'success'      => true,
+        'tfa_required' => true,
+        'tfa_token'    => $pendingToken,
+        'message'      => 'يتطلب هذا الحساب رمز المصادقة الثنائية',
+    ];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // ✅ Multi-Tenant Helper: يُستخدم في كل ملف API لضمان تصفية كل استعلام
 // بـ tenant_id الخاص بالمستخدم المسجّل دخوله حالياً — يمنع تسريب بيانات بين
 // المتاجر. يُستدعى بعد require_auth()/require_admin()/... مباشرة.
