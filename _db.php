@@ -103,7 +103,10 @@ header('Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS');
 header('Access-Control-Allow-Headers: Content-Type, Authorization');
 header('Access-Control-Max-Age: 86400');
 
-if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+// ✅ Task 11: ($_SERVER['REQUEST_METHOD'] ?? '') — يمنع تحذير "Undefined array
+// key" عند تشغيل هذا الملف من سطر الأوامر (CLI)، مثل migrate.php، حيث لا
+// يُعرَّف REQUEST_METHOD إطلاقاً (لا يوجد طلب HTTP). لا يُغيّر أي سلوك HTTP.
+if (($_SERVER['REQUEST_METHOD'] ?? '') === 'OPTIONS') {
     http_response_code(204);
     exit;
 }

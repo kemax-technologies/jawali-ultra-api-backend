@@ -50,6 +50,8 @@ try {
             'backups.php?action=download&id={id}',
             'backups.php (POST action=create|restore|delete)',
             'backup_cron.php?key={secret} (اختياري لـ cron حقيقي)',
+            // 🗄️ إطار ترحيل قاعدة البيانات (جديد) — راجع migrations/README.md
+            'migrate.php?key={secret} (اطّلاع status فقط عبر HTTP — apply/backfill من CLI فقط)',
             // 📷 الكاميرا المساعدة (اختياري)
             'scanner_session.php (POST)',
             'scanner_session.php?id={id}',
