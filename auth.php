@@ -28,7 +28,9 @@ function validate_password_strength(string $password): ?string {
 
 // يُصدر جلسة دخول كاملة (JWT + تسجيل الجلسة + سجل التدقيق) — نقطة مشتركة
 // يستخدمها كلا مساري الدخول: المباشر (بدون 2FA) والمكتمل بعد التحقق (verify_2fa)
-function issue_full_session(array $user): array {
+// ✅ Task 6 — $deviceLabel اختياري يصف الجهاز بشكل صديق (Android/iOS/متصفح)
+// لعرضه لاحقاً في شاشة "الجلسات النشطة" على الخادم.
+function issue_full_session(array $user, ?string $deviceLabel = null): array {
     $token = jwt_create([
         'sub'   => (int)$user['id'],
         'email' => $user['email'],
@@ -36,7 +38,7 @@ function issue_full_session(array $user): array {
     ]);
 
     // 🔐 تسجيل الجهاز/الجلسة لكل الأدوار
-    log_user_session($user['email'], (string)($user['role'] ?? ''), $token);
+    log_user_session($user['email'], (string)($user['role'] ?? ''), $token, $deviceLabel);
     audit('تسجيل دخول (' . ($user['role'] ?? '') . ')', $user['email'], 'info', (int)($user['tenant_id'] ?? 0) ?: null);
 
     $permissions = effective_permissions((string)($user['role'] ?? ''), $user['permissions'] ?? null);
@@ -110,7 +112,7 @@ switch ($action) {
         // ✅ تم حذف admin_web بالكامل من النظام — لم يعد هناك أي تسجيل في
         // admin_sessions هنا. تتبّع الجلسات لكل الأدوار يتم فقط عبر
         // user_sessions (انظر issue_full_session أعلاه).
-        json_ok(issue_full_session($user));
+        json_ok(issue_full_session($user, isset($body['device_label']) ? (string)$body['device_label'] : null));
         break;
 
     // ✅ Task 5 — الخطوة الثانية من تسجيل الدخول عند تفعيل 2FA: يستبدل
@@ -161,7 +163,7 @@ switch ($action) {
         rl_clear('verify_2fa', $tokenHash . '|' . $ip);
         db()->prepare('DELETE FROM tfa_pending_logins WHERE token_hash = ?')->execute([$tokenHash]);
 
-        json_ok(issue_full_session($user));
+        json_ok(issue_full_session($user, isset($body['device_label']) ? (string)$body['device_label'] : null));
         break;
 
     // ✅ Task 5 — بدء إعداد 2FA: يُنشئ الخادم سراً جديداً (لا يُخزَّن نهائياً
@@ -351,6 +353,85 @@ switch ($action) {
             } catch (Exception $e) { /* تجاهل بأمان */ }
         }
         json_ok(['success' => true]);
+        break;
+
+    // ─────────────────────────────────────────────────────────────────────
+    // ✅ Task 6 — إدارة الجلسات النشطة (عرض/إلغاء) — يمنح المستخدم رؤية على
+    // كل جهاز سجّل منه دخولاً حالياً، مع إمكانية إلغاء أي جلسة يشتبه بها
+    // فوراً (سرقة توكن، جهاز مفقود، جهاز عام...) دون الحاجة لتغيير كلمة
+    // المرور أو انتظار انتهاء صلاحية الجلسة تلقائياً (7 أيام).
+    // ─────────────────────────────────────────────────────────────────────
+
+    case 'list_sessions':
+        $auth = require_auth();
+        $currentHash = hash('sha256', (string)bearer_token());
+        $stmt = db()->prepare(
+            'SELECT id, device_info, ip_address, created_at, last_seen, expires_at, token_hash
+             FROM user_sessions
+             WHERE user_email = ? AND revoked = 0 AND expires_at > NOW()
+             ORDER BY last_seen DESC'
+        );
+        $stmt->execute([$auth['email'] ?? '']);
+        $sessions = array_map(
+            function (array $row) use ($currentHash): array {
+                return [
+                    'id'          => (int)$row['id'],
+                    'device_info' => $row['device_info'],
+                    'ip_address'  => $row['ip_address'],
+                    'created_at'  => $row['created_at'],
+                    'last_seen'   => $row['last_seen'],
+                    'expires_at'  => $row['expires_at'],
+                    'is_current'  => hash_equals($currentHash, (string)$row['token_hash']),
+                ];
+            },
+            $stmt->fetchAll()
+        );
+        json_ok(['success' => true, 'sessions' => $sessions]);
+        break;
+
+    // ✅ إلغاء جلسة واحدة محددة — شرط user_email = auth['email'] إلزامي في
+    // الاستعلام نفسه لمنع أي إمكانية لإلغاء جلسة تخص مستخدماً آخر مهما كان
+    // معرّف الجلسة (session_id) الذي يُرسله العميل.
+    case 'revoke_session':
+        if ($method !== 'POST') json_error('استخدم POST', 405);
+        $auth = require_auth();
+        $body = input_json();
+        $sessionId = (int)($body['session_id'] ?? 0);
+        if ($sessionId <= 0) json_error('معرّف الجلسة مطلوب');
+
+        $stmt = db()->prepare(
+            'UPDATE user_sessions SET revoked = 1 WHERE id = ? AND user_email = ? AND revoked = 0'
+        );
+        $stmt->execute([$sessionId, $auth['email'] ?? '']);
+        if ($stmt->rowCount() === 0) {
+            json_error('الجلسة غير موجودة أو أُلغيت مسبقاً', 404);
+        }
+
+        audit('إلغاء جلسة دخول', $auth['email'] ?? null, 'info', tenant_id_from_auth($auth));
+        json_ok(['success' => true]);
+        break;
+
+    // ✅ إلغاء كل الجلسات الأخرى دفعة واحدة (عدا الجلسة الحالية التي يُنفَّذ
+    // منها هذا الطلب) — مفيد بعد الشك بتسريب كلمة المرور أو استخدام جهاز
+    // عام/مشترك لتسجيل الدخول.
+    case 'revoke_all_other_sessions':
+        if ($method !== 'POST') json_error('استخدم POST', 405);
+        $auth = require_auth();
+        $currentHash = hash('sha256', (string)bearer_token());
+        $stmt = db()->prepare(
+            'UPDATE user_sessions SET revoked = 1
+             WHERE user_email = ? AND revoked = 0 AND token_hash <> ?'
+        );
+        $stmt->execute([$auth['email'] ?? '', $currentHash]);
+        $count = $stmt->rowCount();
+
+        audit(
+            'إلغاء كل الجلسات الأخرى (' . $count . ')',
+            $auth['email'] ?? null,
+            'warning',
+            tenant_id_from_auth($auth)
+        );
+        json_ok(['success' => true, 'revoked_count' => $count]);
         break;
 
     // ✅ تأكيد كلمة مرور مدير المتجر — يُستخدم في العمليات الحساسة (حذف

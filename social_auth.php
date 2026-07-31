@@ -167,7 +167,12 @@ function _asn1_length(int $len): string {
 }
 
 // ─── إصدار JWT وحفظ آخر تسجيل دخول ────────────────────────────────────────────
-function issue_session_for_user(array $user): array {
+// ✅ Task 6 — أضيف تسجيل الجلسة (log_user_session) هنا أيضاً: كانت جلسات
+// الدخول الاجتماعي (Google/Apple/الهاتف) غير مُسجَّلة إطلاقاً في user_sessions
+// (فقط auth.php كان يُسجِّلها)، أي أن شاشة "الجلسات النشطة" الجديدة كانت
+// ستكون غير مكتملة تماماً لهذه المسارات (لا تظهر، ولا يمكن إلغاؤها عن بُعد).
+// $deviceLabel اختياري (Android/iOS/متصفح) يصف الجهاز بشكل صديق.
+function issue_session_for_user(array $user, ?string $deviceLabel = null): array {
     db()->prepare('UPDATE users SET last_login_at = NOW() WHERE id = ?')
         ->execute([$user['id']]);
     $token = jwt_create([
@@ -175,6 +180,7 @@ function issue_session_for_user(array $user): array {
         'email' => $user['email'],
         'role'  => $user['role'],
     ]);
+    log_user_session($user['email'], (string)($user['role'] ?? ''), $token, $deviceLabel);
     // ✅ Task 5: يُطابق شكل استجابة issue_full_session() في auth.php لضمان
     // أن AppUser.fromMap في Flutter يقرأ tenant_id/permissions/tfa_enabled
     // بشكل صحيح بغضّ النظر عن مسار الدخول (محلي أو اجتماعي).
@@ -316,7 +322,7 @@ switch ($action) {
         // ✅ Task 5 — بوّابة 2FA الموحّدة (راجع تعريفها في _db.php)
         $tfaResp = tfa_gate($user);
         if ($tfaResp !== null) json_ok($tfaResp);
-        json_ok(issue_session_for_user($user));
+        json_ok(issue_session_for_user($user, isset($body['device_label']) ? (string)$body['device_label'] : null));
         break;
 
     // ════════════════════════════════════════════════════════════════════
@@ -341,7 +347,7 @@ switch ($action) {
         // ✅ Task 5 — بوّابة 2FA الموحّدة
         $tfaResp = tfa_gate($user);
         if ($tfaResp !== null) json_ok($tfaResp);
-        json_ok(issue_session_for_user($user));
+        json_ok(issue_session_for_user($user, isset($body['device_label']) ? (string)$body['device_label'] : null));
         break;
 
     // ════════════════════════════════════════════════════════════════════
@@ -458,7 +464,7 @@ switch ($action) {
         // ✅ Task 5 — بوّابة 2FA الموحّدة (تنطبق أيضاً على الدخول عبر الهاتف)
         $tfaResp = tfa_gate($user);
         if ($tfaResp !== null) json_ok($tfaResp);
-        json_ok(issue_session_for_user($user));
+        json_ok(issue_session_for_user($user, isset($body['device_label']) ? (string)$body['device_label'] : null));
         break;
 
     default:

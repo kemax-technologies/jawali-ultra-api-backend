@@ -286,14 +286,21 @@ function effective_permissions(string $role, $permissionsJson): array {
 define('SESSION_IDLE_TIMEOUT_MIN', (int)(getenv('SESSION_IDLE_TIMEOUT_MIN') ?: 30));
 
 // ── تسجيل جلسة دخول جديدة لأي دور (تعميم admin_sessions القديم) ─────────────
-function log_user_session(string $email, string $role, string $token): void {
+// ✅ Task 6 — device_info أصبح يقبل تسمية صديقة للجهاز يُرسلها تطبيق Flutter
+// نفسه (مثل "Android" أو "iOS" أو "متصفح ويب") بدل الاعتماد فقط على
+// HTTP_User-Agent الخام (غالباً غير مفيد لعميل HTTP في Dart، مثل
+// "Dart/3.9 (dart:io)")، لتظهر شاشة "الجلسات النشطة" بشكل مفيد للمستخدم.
+function log_user_session(string $email, string $role, string $token, ?string $deviceLabel = null): void {
     try {
         $ip = $_SERVER['REMOTE_ADDR'] ?? '';
         $ua = substr($_SERVER['HTTP_USER_AGENT'] ?? '', 0, 240);
+        $device = $deviceLabel !== null && trim($deviceLabel) !== ''
+            ? substr(trim($deviceLabel), 0, 240)
+            : ($ua !== '' ? $ua : 'جهاز غير معروف');
         db()->prepare(
             'INSERT INTO user_sessions (user_email, role, token_hash, device_info, ip_address, user_agent, expires_at)
              VALUES (?, ?, ?, ?, ?, ?, NOW() + INTERVAL \'7 days\')'
-        )->execute([$email, $role, hash('sha256', $token), $ua, $ip, $ua]);
+        )->execute([$email, $role, hash('sha256', $token), $device, $ip, $ua]);
     } catch (Exception $e) { /* تجاهل بأمان — لا نمنع تسجيل الدخول لهذا الخطأ */ }
 }
 
