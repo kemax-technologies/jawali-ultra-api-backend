@@ -2,6 +2,7 @@
 require_once __DIR__ . '/_db.php';
 require_once __DIR__ . '/_rate_limit.php';
 require_once __DIR__ . '/_totp.php';
+require_once __DIR__ . '/_backup_helpers.php';
 
 $action = $_GET['action'] ?? '';
 $method = $_SERVER['REQUEST_METHOD'];
@@ -40,6 +41,15 @@ function issue_full_session(array $user, ?string $deviceLabel = null): array {
     // 🔐 تسجيل الجهاز/الجلسة لكل الأدوار
     log_user_session($user['email'], (string)($user['role'] ?? ''), $token, $deviceLabel);
     audit('تسجيل دخول (' . ($user['role'] ?? '') . ')', $user['email'], 'info', (int)($user['tenant_id'] ?? 0) ?: null);
+
+    // ✅ Task 8 — نسخ احتياطي تلقائي مركزي "فرصي": بما أن تسجيل الدخول يحدث
+    // بشكل متكرر وموثوق لكل متجر نشط، فهو نقطة مثالية لضمان نسخة احتياطية
+    // تلقائية دورية (كل ≥24 ساعة) حتى بدون أي صلاحية cron حقيقية على الخادم.
+    // best-effort تماماً: لا يمكن أبداً أن يُفشل أو يُبطئ عملية تسجيل الدخول.
+    $tid = (int)($user['tenant_id'] ?? 0);
+    if ($tid > 0) {
+        maybe_auto_backup(db(), $tid);
+    }
 
     $permissions = effective_permissions((string)($user['role'] ?? ''), $user['permissions'] ?? null);
 

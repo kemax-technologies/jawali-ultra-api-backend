@@ -45,6 +45,11 @@ try {
             'credit_payments.php',
             'credit_payments.php?credit_id={id}',
             'credit_payments.php?customer={phone}',
+            // 💾 النسخ الاحتياطي المركزي التلقائي (جديد)
+            'backups.php?action=list',
+            'backups.php?action=download&id={id}',
+            'backups.php (POST action=create|restore|delete)',
+            'backup_cron.php?key={secret} (اختياري لـ cron حقيقي)',
             // 📷 الكاميرا المساعدة (اختياري)
             'scanner_session.php (POST)',
             'scanner_session.php?id={id}',
