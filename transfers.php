@@ -134,7 +134,7 @@ switch ($method) {
             } catch (Exception $e) {
                 $pdo->rollBack();
                 error_log('[Jawali][transfers] فشل الصرف: ' . $e->getMessage());
-                json_error($e->getMessage() ?: 'فشل تنفيذ عملية الصرف', 500);
+                json_error('فشل تنفيذ عملية الصرف', 500);
             }
 
             audit("transfer completed {$tr['id']} code=$code", null, 'info', $tenantId);
@@ -240,7 +240,7 @@ switch ($method) {
         } catch (Exception $e) {
             $pdo->rollBack();
             error_log('[Jawali][transfers] فشل إنشاء التحويل: ' . $e->getMessage());
-            json_error($e->getMessage() ?: 'فشل إنشاء التحويل', 500);
+            json_error('فشل إنشاء التحويل', 500);
         }
 
         audit("create transfer $id amount=$amount commission=$commission code=$code", null, 'info', $tenantId);

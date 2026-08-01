@@ -192,6 +192,14 @@ switch ($method) {
                 $_SERVER['HTTP_X_USER_EMAIL'] ?? '', $tenantId,
             ]);
 
+            // ⚡ تحسين أداء: إعداد الاستعلامات مرة واحدة خارج الحلقة بدل إعادة
+            // تجهيزها لكل سطر (يقلّل رحلات الشبكة إلى قاعدة البيانات عند وجود
+            // عدة أسطر في القيد المحاسبي).
+            $accChk = $pdo->prepare('SELECT 1 FROM chart_of_accounts WHERE id = ? AND tenant_id = ?');
+            $insLine = $pdo->prepare(
+                'INSERT INTO journal_entry_lines (id, entry_id, account_id, debit, credit, notes, tenant_id)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)'
+            );
             foreach ($lines as $i => $l) {
                 $accountId = trim($l['account_id'] ?? $l['accountId'] ?? '');
                 if ($accountId === '') {
@@ -199,17 +207,13 @@ switch ($method) {
                     json_error('account_id مطلوب لكل سطر');
                 }
                 // ✅ Multi-Tenant: التأكد أن الحساب ينتمي للمتجر الحالي
-                $accChk = $pdo->prepare('SELECT 1 FROM chart_of_accounts WHERE id = ? AND tenant_id = ?');
                 $accChk->execute([$accountId, $tenantId]);
                 if (!$accChk->fetch()) {
                     $pdo->rollBack();
                     json_error('الحساب ' . $accountId . ' لا ينتمي لمتجرك', 404);
                 }
                 $lineId = $id . '-L' . ($i + 1);
-                $pdo->prepare(
-                    'INSERT INTO journal_entry_lines (id, entry_id, account_id, debit, credit, notes, tenant_id)
-                     VALUES (?, ?, ?, ?, ?, ?, ?)'
-                )->execute([
+                $insLine->execute([
                     $lineId, $id, $accountId,
                     (float)($l['debit'] ?? 0), (float)($l['credit'] ?? 0),
                     $l['notes'] ?? '', $tenantId,

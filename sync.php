@@ -32,7 +32,9 @@ switch ($method) {
         $expensesStmt->execute([$tenantId]);
         $expenses = $expensesStmt->fetchAll();
 
-        $suppliersStmt = $pdo->prepare('SELECT * FROM suppliers WHERE tenant_id = ? ORDER BY name');
+        // ⚡ تحسين أداء/استقرار: إضافة حد أقصى دفاعي مثل باقي الاستعلامات أعلاه
+        // (منتجات/عملاء/فواتير/مصروفات) لتفادي أي بطء نظري في متجر بعدد موردين ضخم جداً.
+        $suppliersStmt = $pdo->prepare('SELECT * FROM suppliers WHERE tenant_id = ? ORDER BY name LIMIT 1000');
         $suppliersStmt->execute([$tenantId]);
         $suppliers = $suppliersStmt->fetchAll();
 
