@@ -66,26 +66,18 @@ $allowedOrigins = [
     'http://10.0.2.2',         // محاكي Android
     'capacitor://localhost',   // تطبيق Capacitor
     'ionic://localhost',       // تطبيق Ionic
-    'http://localhost:5500',   // لوحة الكاشير - Live Server
-    'http://127.0.0.1:5500',  // لوحة الكاشير - Live Server
-    'http://localhost:8080',   // لوحة الكاشير - بديل
-    'http://127.0.0.1:8080',  // لوحة الكاشير - بديل
+    'http://localhost:5500',   // تطوير محلي - Live Server
+    'http://127.0.0.1:5500',  // تطوير محلي - Live Server
+    'http://localhost:8080',   // تطوير محلي - بديل
+    'http://127.0.0.1:8080',  // تطوير محلي - بديل
     'https://jawali-dev-panel.pages.dev', // لوحة تحكم المطوّر (Cloudflare Pages)
-    'https://jawali-admin-web.pages.dev', // لوحة تحكم المدير — الويب (Cloudflare Pages)
-    'https://jawali-cashier-web.pages.dev', // لوحة الكاشير — الويب (قديم، مُبقى للتوافق الخلفي)
-    'https://jawali-ultra.pages.dev', // ✅ نسخة الويب الكاملة المطابقة لتطبيق APK (الاسم الرسمي الجديد)
+    'https://jawali-ultra.pages.dev', // ✅ نسخة الويب الكاملة المطابقة لتطبيق APK (الاسم الرسمي)
     'https://5061-ivf2f8x49hes7put1szwa-82b888ba.sandbox.novita.ai', // معاينة لوحة المطوّر داخل الـ sandbox الحالي
 ];
 $origin = $_SERVER['HTTP_ORIGIN'] ?? '';
 // ✅ السماح لأي subdomain فرعي لـ *.pages.dev الخاص بمشاريع لوحات الويب (نسخ Preview)
 $originHost = $origin !== '' ? (parse_url($origin, PHP_URL_HOST) ?? '') : '';
 if ($originHost !== '' && str_ends_with($originHost, '.jawali-dev-panel.pages.dev')) {
-    $allowedOrigins[] = $origin;
-}
-if ($originHost !== '' && str_ends_with($originHost, '.jawali-admin-web.pages.dev')) {
-    $allowedOrigins[] = $origin;
-}
-if ($originHost !== '' && str_ends_with($originHost, '.jawali-cashier-web.pages.dev')) {
     $allowedOrigins[] = $origin;
 }
 if ($originHost !== '' && str_ends_with($originHost, '.jawali-ultra.pages.dev')) {
