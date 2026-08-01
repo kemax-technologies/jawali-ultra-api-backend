@@ -72,7 +72,8 @@ $allowedOrigins = [
     'http://127.0.0.1:8080',  // لوحة الكاشير - بديل
     'https://jawali-dev-panel.pages.dev', // لوحة تحكم المطوّر (Cloudflare Pages)
     'https://jawali-admin-web.pages.dev', // لوحة تحكم المدير — الويب (Cloudflare Pages)
-    'https://jawali-cashier-web.pages.dev', // لوحة الكاشير — الويب (Cloudflare Pages)
+    'https://jawali-cashier-web.pages.dev', // لوحة الكاشير — الويب (قديم، مُبقى للتوافق الخلفي)
+    'https://jawali-ultra.pages.dev', // ✅ نسخة الويب الكاملة المطابقة لتطبيق APK (الاسم الرسمي الجديد)
     'https://5061-ivf2f8x49hes7put1szwa-82b888ba.sandbox.novita.ai', // معاينة لوحة المطوّر داخل الـ sandbox الحالي
 ];
 $origin = $_SERVER['HTTP_ORIGIN'] ?? '';
@@ -85,6 +86,9 @@ if ($originHost !== '' && str_ends_with($originHost, '.jawali-admin-web.pages.de
     $allowedOrigins[] = $origin;
 }
 if ($originHost !== '' && str_ends_with($originHost, '.jawali-cashier-web.pages.dev')) {
+    $allowedOrigins[] = $origin;
+}
+if ($originHost !== '' && str_ends_with($originHost, '.jawali-ultra.pages.dev')) {
     $allowedOrigins[] = $origin;
 }
 // ✅ السماح لأي نطاق فرعي من sandbox.novita.ai (بيئة التطوير الحالية) لمعاينة لوحات الويب
