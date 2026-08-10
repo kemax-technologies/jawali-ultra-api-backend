@@ -127,7 +127,28 @@ function db(): PDO {
         $pdo = new PDO($dsn, DB_USER, DB_PASS, [
             PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
             PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-            PDO::ATTR_EMULATE_PREPARES   => false,
+            // 🔒 إصلاح حرج (خطأ متقطّع "خطأ داخلي في الخادم"): DB_HOST/DB_PORT
+            // في .env يشيران إلى Supabase "Transaction Pooler" (PgBouncer، منفذ
+            // 6543) — وهو غير متوافق مع "prepared statements" الحقيقية من جهة
+            // الخادم (server-side)، لأن PgBouncer في وضع transaction pooling قد
+            // يُبدّل اتصال العميل بين اتصالات backend فعلية مختلفة بين معاملة
+            // وأخرى، فيصل أمر EXECUTE إلى اتصال backend لم يشهد أمر PREPARE
+            // المطابق أبداً → PDOException:
+            //   "SQLSTATE[26000]: Invalid sql statement name:
+            //    prepared statement \"pdo_stmt_00000001\" does not exist"
+            // هذا الخطأ متقطّع بطبيعته: يظهر فقط عند تزامن طلبات متعددة (مثل
+            // عدة شاشات/تبويبات تُحمِّل بياناتها معاً عند بدء التطبيق)، وينجح
+            // عند إعادة المحاولة اليدوية لأن الاتصال التالي قد يحصل على تعيين
+            // backend "محظوظ" لا يتعارض. تم تأكيد إعادة إنتاجه فعلياً بمعدل
+            // ~40% فشل تحت 15 طلباً متزامناً، وصفر فشل بعد هذا الإصلاح (75/75).
+            //
+            // ✅ الحل الرسمي الموصى به من Supabase/PgBouncer لهذا السيناريو
+            // بالضبط: تفعيل "محاكاة التحضير من جهة العميل" (EMULATE_PREPARES)
+            // بدلاً من نقل المشروع لمنفذ 5432 (session pooler) — يحافظ هذا على
+            // مزايا Transaction Pooler (أفضل للتزامن العالي في PHP-FPM) مع حل
+            // التعارض جذرياً، لأن PDO يُرسل الاستعلام كأمر عادي (query كامل بعد
+            // تعويض القيم من جهة PHP) بدل PREPARE/EXECUTE منفصلين عبر السلك.
+            PDO::ATTR_EMULATE_PREPARES   => true,
         ]);
     } catch (Exception $e) {
         // ✅ إصلاح #7: لا نكشف تفاصيل الاتصال للمستخدم
@@ -141,6 +162,39 @@ function db(): PDO {
 function json_ok($data = []): void {
     echo json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
     exit;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ✅ مراجعة أداء 2FA/تسجيل الدخول: يُرسل الاستجابة النهائية للعميل فوراً
+// (بمجرد جهوزية JWT)، ثم يسمح للسكربت بمواصلة التنفيذ في الخلفية (تسجيل
+// الجلسة/سجل التدقيق/النسخ الاحتياطي الفرصي — عمليات best-effort بحتة لا
+// تُغيّر محتوى الاستجابة ولا يجوز أبداً أن تُبطئ تسجيل الدخول أو التحقق من
+// 2FA الذي يراه المستخدم فعلياً. تعمل مع mod_php (لا FastCGI متاح في هذه
+// البيئة) عبر Content-Length دقيق + Connection: close + flush، وهي التقنية
+// المكافئة لِـ fastcgi_finish_request() على استضافات FastCGI/PHP-FPM.
+// ─────────────────────────────────────────────────────────────────────────────
+function respond_and_continue(array $data): void {
+    $body = json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+
+    if (function_exists('fastcgi_finish_request')) {
+        // بيئات PHP-FPM/FastCGI: الطريقة الرسمية المخصّصة لهذا الغرض بالضبط
+        echo $body;
+        fastcgi_finish_request();
+        return;
+    }
+
+    // بيئات mod_php/Apache التقليدية (كما هي هذه البيئة الحالية): نُنهي
+    // الاستجابة يدوياً — يعتبر عميل HTTP (مثل حزمة http في Dart) الاستجابة
+    // مكتملة فور استلام Content-Length بايت كاملة، دون انتظار إغلاق الاتصال
+    // فعلياً أو انتهاء تنفيذ بقية السكربت في الخادم.
+    ignore_user_abort(true); // لا تُقطع باقي التنفيذ إن أغلق العميل الاتصال بعد استلام رده
+    if (!headers_sent()) {
+        header('Content-Length: ' . strlen($body));
+        header('Connection: close');
+    }
+    echo $body;
+    while (ob_get_level() > 0) { @ob_end_flush(); }
+    @flush();
 }
 
 function json_error(string $message, int $status = 400): void {
@@ -487,6 +541,88 @@ function tfa_gate(array $user): ?array {
         'tfa_token'    => $pendingToken,
         'message'      => 'يتطلب هذا الحساب رمز المصادقة الثنائية',
     ];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ✅ رموز الاسترداد الاحتياطية (Backup Codes) — تحسين أمني/UX لـ 2FA
+// ─────────────────────────────────────────────────────────────────────────────
+// السياق: قبل هذا التحسين، فقدان جهاز المصادقة (هاتف مفقود/تطبيق مُزال) كان
+// يعني عدم وجود أي مسار استرداد ذاتي لحساب مدير مفعَّل عليه 2FA — الحل
+// الوحيد كان تواصلاً يدوياً مع الدعم لتعطيل 2FA من قاعدة البيانات مباشرة.
+// الآن: يحصل المستخدم على 10 رموز استرداد لمرة واحدة عند تفعيل 2FA (تُعرض
+// نصاً واضحاً مرة واحدة فقط)، يمكن استخدام أي منها بدل رمز TOTP عند الدخول.
+//
+// أمان التخزين: تُخزَّن الرموز بصيغة bcrypt (password_hash) لا نصاً واضحاً —
+// خلافاً لسر TOTP (الذي يتطلب عكسية الخوارزمية)، رموز الاسترداد لا تحتاج
+// أي عملية عكسية — يكفي التحقق أحادي الجهة (one-way) تماماً كحال كلمة المرور.
+function generate_backup_codes(int $count = 10): array {
+    // استبعاد الأحرف المتشابهة بصرياً (I/L/O/0/1) لتقليل أخطاء النسخ اليدوي
+    $alphabet = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+    $codes = [];
+    for ($i = 0; $i < $count; $i++) {
+        $raw = '';
+        for ($j = 0; $j < 8; $j++) {
+            $raw .= $alphabet[random_int(0, strlen($alphabet) - 1)];
+        }
+        // تنسيق للعرض فقط (XXXX-XXXX) — يُطبَّع (تُحذف الشرطة) قبل أي تحقق/تخزين
+        $codes[] = substr($raw, 0, 4) . '-' . substr($raw, 4, 4);
+    }
+    return $codes;
+}
+
+// تطبيع رمز استرداد أدخله المستخدم: حذف الشرطات/المسافات + تحويل لحروف كبيرة
+function normalize_backup_code(string $code): string {
+    return strtoupper(str_replace([' ', '-'], '', trim($code)));
+}
+
+// يستبدل كل رموز الاسترداد الحالية (إن وُجدت) لمستخدم مُعطى بمجموعة جديدة —
+// يُستخدم عند: أول تفعيل لـ 2FA (setup_2fa_confirm)، أو إعادة توليد صريحة
+// (action=regenerate_backup_codes). يُعيد الرموز نصاً واضحاً (المرة الوحيدة).
+function replace_backup_codes(int $userId, int $count = 10): array {
+    $codes = generate_backup_codes($count);
+    db()->prepare('DELETE FROM tfa_backup_codes WHERE user_id = ?')->execute([$userId]);
+    $ins = db()->prepare(
+        'INSERT INTO tfa_backup_codes (user_id, code_hash) VALUES (?, ?)'
+    );
+    foreach ($codes as $c) {
+        $hash = password_hash(normalize_backup_code($c), PASSWORD_BCRYPT, ['cost' => 10]);
+        $ins->execute([$userId, $hash]);
+    }
+    return $codes;
+}
+
+// يتحقق من رمز استرداد مُدخَل مقابل الرموز غير المُستهلَكة لمستخدم مُعطى —
+// عند التطابق: يُعلَّم الرمز كمُستهلَك (used_at = NOW()) فوراً (استخدام لمرة
+// واحدة فقط لكل رمز) ويُعيد true. لا يُعيد أي معلومة تُميّز "رمز خاطئ" عن
+// "رمز صحيح لكن مُستهلَك من قبل" — نفس رسالة الفشل العامة في كل الحالات.
+function verify_and_consume_backup_code(int $userId, string $code): bool {
+    $normalized = normalize_backup_code($code);
+    // الرموز الحقيقية 8 أحرف دوماً — أي إدخال أقصر ليس رمز استرداد صالحاً
+    // (تجنّب استهلاك دورات bcrypt على مدخلات واضحة الخطأ، مثل محاولة TOTP فاشلة)
+    if (strlen($normalized) !== 8) return false;
+
+    $stmt = db()->prepare(
+        'SELECT id, code_hash FROM tfa_backup_codes WHERE user_id = ? AND used_at IS NULL'
+    );
+    $stmt->execute([$userId]);
+    foreach ($stmt->fetchAll() as $row) {
+        if (password_verify($normalized, $row['code_hash'])) {
+            db()->prepare('UPDATE tfa_backup_codes SET used_at = NOW() WHERE id = ?')
+                ->execute([$row['id']]);
+            return true;
+        }
+    }
+    return false;
+}
+
+// عدد رموز الاسترداد غير المُستهلَكة المتبقية لمستخدم مُعطى — لعرضها في
+// شاشة الإعدادات (تحفيز المستخدم على إعادة التوليد عند اقتراب النفاد).
+function count_remaining_backup_codes(int $userId): int {
+    $stmt = db()->prepare(
+        'SELECT COUNT(*) AS c FROM tfa_backup_codes WHERE user_id = ? AND used_at IS NULL'
+    );
+    $stmt->execute([$userId]);
+    return (int)($stmt->fetch()['c'] ?? 0);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

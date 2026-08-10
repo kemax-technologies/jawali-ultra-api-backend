@@ -32,6 +32,13 @@ switch ($method) {
         $tenantId = tenant_id_from_auth($auth);
         // ملخص إحصائي
         if (isset($_GET['summary'])) {
+            // 🆕 نفصل هنا بوضوح بين قيود "عليه" (debit — ذمم مستحقة لنا)
+            // وقيود "له" (credit — أرصدة مستحقة للعملاء علينا)، بدلاً من
+            // جمعهما معاً في حقل واحد مضلِّل. هذا يطابق نفس منطق التمييز
+            // المُطبَّق في تطبيق Flutter (AppStore.totalCreditRemaining
+            // تحتسب "عليه" فقط، وAppStore.totalPayableToCustomers تحتسب
+            // "له" فقط) — حتى لا يُعطي هذا الـ endpoint نتائج تُخالف تلك
+            // المستخدَمة فعلياً في الواجهة إذا استُخدم مستقبلاً.
             $stmt = $pdo->prepare("
                 SELECT
                   COUNT(*)                        AS total_credits,
@@ -39,8 +46,14 @@ switch ($method) {
                   SUM(amount_usd)                 AS total_amount_usd,
                   SUM(paid_yer)                   AS total_paid_yer,
                   SUM(paid_usd)                   AS total_paid_usd,
-                  SUM(amount_yer - paid_yer)      AS total_remaining_yer,
-                  SUM(amount_usd - paid_usd)      AS total_remaining_usd,
+                  SUM(CASE WHEN direction = 'debit'
+                           THEN (amount_yer - paid_yer) ELSE 0 END) AS total_remaining_yer,
+                  SUM(CASE WHEN direction = 'debit'
+                           THEN (amount_usd - paid_usd) ELSE 0 END) AS total_remaining_usd,
+                  SUM(CASE WHEN direction = 'credit'
+                           THEN (amount_yer - paid_yer) ELSE 0 END) AS total_payable_yer,
+                  SUM(CASE WHEN direction = 'credit'
+                           THEN (amount_usd - paid_usd) ELSE 0 END) AS total_payable_usd,
                   SUM(CASE WHEN (amount_yer - paid_yer) > 0.01 THEN 1 ELSE 0 END) AS open_count,
                   SUM(CASE WHEN due_date IS NOT NULL AND due_date < NOW()
                               AND (amount_yer - paid_yer) > 0.01 THEN 1 ELSE 0 END) AS overdue_count
@@ -112,6 +125,14 @@ switch ($method) {
         $dueDate       = $body['due_date']  ?? $body['dueDate']  ?? null;
         $notes         = $body['notes']     ?? '';
         $status        = $body['status']    ?? 'مفتوح';
+        // 🆕 اتجاه القيد: 'debit' = عليه (مستحق من العميل — الافتراضي
+        // التاريخي)، 'credit' = له (مستحق للعميل). يُتحقَّق من القيمة هنا
+        // أيضاً على مستوى التطبيق كطبقة دفاع ثانية إلى جانب قيد CHECK في
+        // قاعدة البيانات (راجع migrations/010_add_credit_direction.sql).
+        $direction     = $body['direction'] ?? 'debit';
+        if (!in_array($direction, ['debit', 'credit'], true)) {
+            $direction = 'debit';
+        }
 
         if ($customerPhone === '' || $invoiceId === '' || $amountYer <= 0) {
             json_error('customer_phone و invoice_id و amount_yer مطلوبة');
@@ -122,21 +143,22 @@ switch ($method) {
         $stmt = $pdo->prepare(
             'INSERT INTO credits
                (id, tenant_id, customer_phone, invoice_id, amount_yer, amount_usd, exchange_rate,
-                paid_yer, paid_usd, status, date, due_date, notes)
-             VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?, NOW(), ?, ?)
+                paid_yer, paid_usd, status, date, due_date, notes, direction)
+             VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?, NOW(), ?, ?, ?)
              ON CONFLICT (id) DO UPDATE SET
                 amount_yer    = EXCLUDED.amount_yer,
                 amount_usd    = EXCLUDED.amount_usd,
                 exchange_rate = EXCLUDED.exchange_rate,
                 status        = EXCLUDED.status,
                 due_date      = EXCLUDED.due_date,
-                notes         = EXCLUDED.notes
+                notes         = EXCLUDED.notes,
+                direction     = EXCLUDED.direction
              WHERE credits.tenant_id = EXCLUDED.tenant_id'
         );
         $stmt->execute([
             $id, $tenantId, $customerPhone, $invoiceId,
             $amountYer, $amountUsd, $exchangeRate,
-            $status, $dueDate, $notes,
+            $status, $dueDate, $notes, $direction,
         ]);
         audit("create credit $id for $customerPhone amount=$amountYer YER", null, 'info', $tenantId);
         json_ok(['success' => true, 'id' => $id]);
@@ -155,10 +177,17 @@ switch ($method) {
         $sets = [];
         $args = [];
         foreach (['due_date' => 'due_date', 'dueDate' => 'due_date',
-                  'notes' => 'notes', 'status' => 'status'] as $k => $col) {
+                  'notes' => 'notes', 'status' => 'status',
+                  'direction' => 'direction'] as $k => $col) {
             if (array_key_exists($k, $body)) {
+                $val = $body[$k];
+                // 🆕 حماية إضافية عند تحديث الاتجاه عبر PUT — لا نقبل إلا
+                // 'debit' أو 'credit' (راجع نفس القيد في مسار POST أعلاه).
+                if ($col === 'direction' && !in_array($val, ['debit', 'credit'], true)) {
+                    continue;
+                }
                 $sets[] = "$col = ?";
-                $args[] = $body[$k];
+                $args[] = $val;
             }
         }
         if (!$sets) json_error('لا توجد حقول للتحديث');

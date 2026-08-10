@@ -36,49 +36,53 @@ function rl_ensure_table(): void {
  * @param int    $windowSec نافذة الوقت بالثواني
  *
  * يستدعي json_error(429) إذا تجاوز.
+ *
+ * ✅ مراجعة أداء عميقة (طلب المستخدم — تسريع 2FA/الدخول): كانت هذه الدالة
+ * تنفّذ SELECT ثم UPDATE أو INSERT بشكل منفصل — دوماً round-trip واحد
+ * لقراءة الحالة + round-trip ثانٍ للكتابة (أي DB latency مضاعف على كل طلب
+ * دخول أو تحقق 2FA). استُبدلت بعملية UPSERT ذرّية واحدة (INSERT ... ON
+ * CONFLICT DO UPDATE) تُعيد العدّاد الفعلي مباشرة عبر RETURNING — تُنجز نفس
+ * المنطق تماماً (تصفير عند انتهاء النافذة، زيادة العدّاد غير ذلك) في
+ * round-trip واحد فقط بدل اثنين، وبأمان تزامني أفضل (بدون فجوة race
+ * بين SELECT والكتابة تحت حمل عالٍ).
  */
 function rl_check(string $bucket, string $key, int $max = 5, int $windowSec = 900): void {
     rl_ensure_table();
     $pdo = db();
+    $now = time();
 
-    // اجلب السجل الحالي
-    // ✅ تحويل PostgreSQL: UNIX_TIMESTAMP() (MySQL) → EXTRACT(EPOCH FROM ...)
     $stmt = $pdo->prepare(
-        'SELECT attempts, EXTRACT(EPOCH FROM window_start) AS w
-         FROM rate_limits WHERE bucket = ? AND client_key = ? LIMIT 1'
+        'INSERT INTO rate_limits (bucket, client_key, attempts, window_start)
+         VALUES (?, ?, 1, to_timestamp(?))
+         ON CONFLICT (bucket, client_key) DO UPDATE SET
+             attempts = CASE
+                 WHEN EXTRACT(EPOCH FROM (to_timestamp(?) - rate_limits.window_start)) >= ?
+                     THEN 1
+                     ELSE rate_limits.attempts + 1
+             END,
+             window_start = CASE
+                 WHEN EXTRACT(EPOCH FROM (to_timestamp(?) - rate_limits.window_start)) >= ?
+                     THEN to_timestamp(?)
+                     ELSE rate_limits.window_start
+             END
+         RETURNING attempts, EXTRACT(EPOCH FROM window_start) AS w'
     );
-    $stmt->execute([$bucket, $key]);
+    $stmt->execute([$bucket, $key, $now, $now, $windowSec, $now, $windowSec, $now]);
     $row = $stmt->fetch();
 
-    $now = time();
-    if ($row) {
-        $elapsed = $now - (int)$row['w'];
-        if ($elapsed >= $windowSec) {
-            // النافذة انتهت — أعد التصفير
-            // ✅ تحويل PostgreSQL: FROM_UNIXTIME() (MySQL) → to_timestamp()
-            $pdo->prepare(
-                'UPDATE rate_limits SET attempts = 1, window_start = to_timestamp(?)
-                 WHERE bucket = ? AND client_key = ?'
-            )->execute([$now, $bucket, $key]);
-            return;
-        }
-        if ((int)$row['attempts'] >= $max) {
-            $retry = $windowSec - $elapsed;
-            header('Retry-After: ' . $retry);
-            json_error(
-                'عدد المحاولات تجاوز الحد. حاول بعد ' . ceil($retry / 60) . ' دقيقة.',
-                429
-            );
-        }
-        $pdo->prepare(
-            'UPDATE rate_limits SET attempts = attempts + 1
-             WHERE bucket = ? AND client_key = ?'
-        )->execute([$bucket, $key]);
-    } else {
-        $pdo->prepare(
-            'INSERT INTO rate_limits (bucket, client_key, attempts, window_start)
-             VALUES (?, ?, 1, to_timestamp(?))'
-        )->execute([$bucket, $key, $now]);
+    // fallback نظري بحت (لا يجب أن يحدث أبداً مع RETURNING) — لا نمنع الطلب
+    if (!$row) return;
+
+    $attempts = (int)$row['attempts'];
+    $windowStart = (int)$row['w'];
+    if ($attempts > $max) {
+        $elapsed = $now - $windowStart;
+        $retry = max(1, $windowSec - $elapsed);
+        header('Retry-After: ' . $retry);
+        json_error(
+            'عدد المحاولات تجاوز الحد. حاول بعد ' . ceil($retry / 60) . ' دقيقة.',
+            429
+        );
     }
 }
 

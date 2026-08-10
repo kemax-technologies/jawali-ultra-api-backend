@@ -32,24 +32,16 @@ function validate_password_strength(string $password): ?string {
 // ✅ Task 6 — $deviceLabel اختياري يصف الجهاز بشكل صديق (Android/iOS/متصفح)
 // لعرضه لاحقاً في شاشة "الجلسات النشطة" على الخادم.
 function issue_full_session(array $user, ?string $deviceLabel = null): array {
+    // ✅ مراجعة أداء (تحقق 2FA/تسجيل الدخول): بناء الاستجابة هنا CPU بحت
+    // (JWT + صلاحيات فعّالة) — لا أي استعلام قاعدة بيانات مطلقاً، لضمان
+    // أسرع رد ممكن للعميل. عمليات القيد (تسجيل الجلسة/سجل التدقيق/النسخ
+    // الاحتياطي الفرصي) انتقلت إلى complete_login_session() أدناه، وتُنفَّذ
+    // فقط بعد إرسال الاستجابة فعلياً للعميل (انظر respond_and_continue).
     $token = jwt_create([
         'sub'   => (int)$user['id'],
         'email' => $user['email'],
         'role'  => $user['role'],
     ]);
-
-    // 🔐 تسجيل الجهاز/الجلسة لكل الأدوار
-    log_user_session($user['email'], (string)($user['role'] ?? ''), $token, $deviceLabel);
-    audit('تسجيل دخول (' . ($user['role'] ?? '') . ')', $user['email'], 'info', (int)($user['tenant_id'] ?? 0) ?: null);
-
-    // ✅ Task 8 — نسخ احتياطي تلقائي مركزي "فرصي": بما أن تسجيل الدخول يحدث
-    // بشكل متكرر وموثوق لكل متجر نشط، فهو نقطة مثالية لضمان نسخة احتياطية
-    // تلقائية دورية (كل ≥24 ساعة) حتى بدون أي صلاحية cron حقيقية على الخادم.
-    // best-effort تماماً: لا يمكن أبداً أن يُفشل أو يُبطئ عملية تسجيل الدخول.
-    $tid = (int)($user['tenant_id'] ?? 0);
-    if ($tid > 0) {
-        maybe_auto_backup(db(), $tid);
-    }
 
     $permissions = effective_permissions((string)($user['role'] ?? ''), $user['permissions'] ?? null);
 
@@ -68,6 +60,37 @@ function issue_full_session(array $user, ?string $deviceLabel = null): array {
             'tfa_enabled' => !empty($user['tfa_enabled']),
         ],
     ];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ✅ مراجعة أداء عميقة (طلب المستخدم): تُنهي جلسة الدخول (login العادي أو
+// verify_2fa) بأسرع ما يمكن من منظور العميل. الفكرة: JWT جاهز خلال ميكروثواني
+// (CPU بحت)، لذا نُرسله فوراً للعميل (respond_and_continue) بدل انتظار 3
+// عمليات كتابة DB إضافية (تسجيل جلسة + سجل تدقيق + نسخ احتياطي فرصي محتمل)
+// لا تُغيّر أي شيء في محتوى الاستجابة ولا يهتم بها العميل إطلاقاً في اللحظة.
+// هذه العمليات best-effort بطبيعتها أصلاً (مُغلَّفة try/catch من قبل) — نقلها
+// لما بعد إرسال الرد لا يُغيّر سلوكها إطلاقاً، فقط يُلغي تأثيرها على زمن
+// استجابة تسجيل الدخول/التحقق الذي يراه المستخدم فعلياً.
+// ─────────────────────────────────────────────────────────────────────────────
+function complete_login_session(array $user, ?string $deviceLabel = null): void {
+    $resp = issue_full_session($user, $deviceLabel);
+
+    // 🚀 الاستجابة تصل للعميل الآن — كل ما يلي ينفَّذ في الخلفية بعد ذلك
+    respond_and_continue($resp);
+
+    $token = $resp['token'];
+    // 🔐 تسجيل الجهاز/الجلسة لكل الأدوار (best-effort، بعد إرسال الرد)
+    log_user_session($user['email'], (string)($user['role'] ?? ''), $token, $deviceLabel);
+    audit('تسجيل دخول (' . ($user['role'] ?? '') . ')', $user['email'], 'info', (int)($user['tenant_id'] ?? 0) ?: null);
+
+    // ✅ Task 8 — نسخ احتياطي تلقائي مركزي "فرصي" — الآن بعد إرسال الرد،
+    // فلا يمكن أبداً أن يُبطئ تسجيل الدخول أو التحقق من 2FA مهما استغرق.
+    $tid = (int)($user['tenant_id'] ?? 0);
+    if ($tid > 0) {
+        maybe_auto_backup(db(), $tid);
+    }
+
+    exit;
 }
 
 // ✅ ملاحظة: create_tfa_pending_token() و tfa_gate() الآن مُعرَّفتان في
@@ -122,7 +145,7 @@ switch ($action) {
         // ✅ تم حذف admin_web بالكامل من النظام — لم يعد هناك أي تسجيل في
         // admin_sessions هنا. تتبّع الجلسات لكل الأدوار يتم فقط عبر
         // user_sessions (انظر issue_full_session أعلاه).
-        json_ok(issue_full_session($user, isset($body['device_label']) ? (string)$body['device_label'] : null));
+        complete_login_session($user, isset($body['device_label']) ? (string)$body['device_label'] : null);
         break;
 
     // ✅ Task 5 — الخطوة الثانية من تسجيل الدخول عند تفعيل 2FA: يستبدل
@@ -142,38 +165,61 @@ switch ($action) {
 
         // ✅ تحديد سقف محاولات تخمين الرمز — بالمفتاح (توكن+IP) بدلاً من
         // البريد لأن العميل هنا لا يُرسل البريد أصلاً في هذا الطلب
+        // (rl_check أصبحت الآن UPSERT ذرّية واحدة بدل SELECT+UPDATE/INSERT)
         rl_check('verify_2fa', $tokenHash . '|' . $ip, 5, 900);
 
-        $pend = db()->prepare(
-            'SELECT user_id FROM tfa_pending_logins WHERE token_hash = ? AND expires_at > NOW() LIMIT 1'
-        );
-        $pend->execute([$tokenHash]);
-        $pendingRow = $pend->fetch();
-        if (!$pendingRow) {
-            json_error('انتهت صلاحية جلسة الدخول المؤقتة — سجّل الدخول مرة أخرى', 401);
-        }
-
+        // ✅ مراجعة أداء عميقة: كان هذا سابقاً استعلامين متتاليين (SELECT
+        // للجلسة المعلَّقة، ثم SELECT ثانٍ للمستخدم). دُمِجا في استعلام JOIN
+        // واحد — يوفّر round-trip كاملاً لقاعدة بيانات Supabase البعيدة على
+        // مسار التحقق من 2FA بالكامل، بدون أي تغيير في المنطق أو النتيجة.
         $stmt = db()->prepare(
-            'SELECT id, name, email, role, is_active, permissions, tenant_id, tfa_enabled, tfa_secret
-             FROM users WHERE id = ? LIMIT 1'
+            'SELECT u.id, u.name, u.email, u.role, u.is_active, u.permissions,
+                    u.tenant_id, u.tfa_enabled, u.tfa_secret
+             FROM tfa_pending_logins p
+             JOIN users u ON u.id = p.user_id
+             WHERE p.token_hash = ? AND p.expires_at > NOW()
+             LIMIT 1'
         );
-        $stmt->execute([$pendingRow['user_id']]);
+        $stmt->execute([$tokenHash]);
         $user = $stmt->fetch();
 
-        if (!$user || !$user['is_active'] || empty($user['tfa_enabled']) || empty($user['tfa_secret'])) {
+        if (!$user) {
+            json_error('انتهت صلاحية جلسة الدخول المؤقتة — سجّل الدخول مرة أخرى', 401);
+        }
+        if (!$user['is_active'] || empty($user['tfa_enabled']) || empty($user['tfa_secret'])) {
             json_error('لا يمكن إكمال هذا الطلب — تواصل مع الدعم', 401);
         }
 
-        if (!totp_verify((string)$user['tfa_secret'], $code)) {
+        // ✅ يقبل التحقق أيضاً رمز استرداد احتياطي (backup code) بدل رمز TOTP —
+        // لمستخدم فقد جهاز المصادقة. totp_verify أولاً (الحالة الأكثر شيوعاً)،
+        // فإن فشل يُحاوَل رمز استرداد (يُستهلَك لمرة واحدة فقط عند التطابق).
+        $totpOk = totp_verify((string)$user['tfa_secret'], $code);
+        $usedBackupCode = false;
+        if (!$totpOk) {
+            $usedBackupCode = verify_and_consume_backup_code((int)$user['id'], $code);
+        }
+        if (!$totpOk && !$usedBackupCode) {
             audit('فشل التحقق من رمز 2FA عند الدخول', $user['email'], 'warning', (int)($user['tenant_id'] ?? 0) ?: null);
             json_error('رمز التحقق غير صحيح', 401);
         }
+        if ($usedBackupCode) {
+            audit('تسجيل دخول برمز استرداد احتياطي (2FA)', $user['email'], 'warning', (int)($user['tenant_id'] ?? 0) ?: null);
+        }
 
-        // ✅ نجاح — الرمز صحيح، مسح المحاولات + استهلاك رمز الدخول المؤقت (لمرة واحدة فقط)
+        // ✅ نجاح — الرمز صحيح. ⚠️ ملاحظة أمنية مقصودة: حذف رمز الدخول
+        // المؤقت (tfa_pending_logins) يبقى **متزامناً هنا قبل إصدار الجلسة**
+        // ولا يُؤجَّل إلى ما بعد الاستجابة — فهو يضمن خاصية "استخدام لمرة
+        // واحدة فقط" لرمز الدخول المؤقت (منع إعادة استخدامه Replay خلال أي
+        // نافذة زمنية ولو قصيرة). مسح rate-limit (rl_clear) عملية سريعة جداً
+        // (DELETE بمفتاح أساسي) وتبقى هنا أيضاً لبساطة الأمان دون فائدة أداء
+        // تُذكر من تأجيلها. المكسب الحقيقي في الأداء تحقق فعلاً بدمج
+        // الاستعلامين (pending+user) أعلاه في JOIN واحد، وبتأجيل تسجيل
+        // الجلسة/سجل التدقيق/النسخ الاحتياطي (غير الحساسة أمنياً) في
+        // complete_login_session أدناه.
         rl_clear('verify_2fa', $tokenHash . '|' . $ip);
         db()->prepare('DELETE FROM tfa_pending_logins WHERE token_hash = ?')->execute([$tokenHash]);
 
-        json_ok(issue_full_session($user, isset($body['device_label']) ? (string)$body['device_label'] : null));
+        complete_login_session($user, isset($body['device_label']) ? (string)$body['device_label'] : null);
         break;
 
     // ✅ Task 5 — بدء إعداد 2FA: يُنشئ الخادم سراً جديداً (لا يُخزَّن نهائياً
@@ -222,8 +268,12 @@ switch ($action) {
             'UPDATE users SET tfa_enabled = 1, tfa_secret = ?, tfa_enabled_at = NOW() WHERE id = ?'
         )->execute([$secret, $auth['sub']]);
 
+        // ✅ توليد رموز استرداد احتياطية (10 رموز) — تُعرض للمستخدم نصاً واضحاً
+        // مرة واحدة فقط هنا؛ يُخزَّن على الخادم فقط hash لكل رمز (bcrypt).
+        $backupCodes = replace_backup_codes((int)$auth['sub']);
+
         audit('تفعيل المصادقة الثنائية (2FA) على مستوى الخادم', $auth['email'] ?? null, 'info', tenant_id_from_auth($auth));
-        json_ok(['success' => true]);
+        json_ok(['success' => true, 'backup_codes' => $backupCodes]);
         break;
 
     // ✅ Task 5 — تعطيل 2FA: يتطلب تأكيد كلمة المرور الحالية دفاعاً عن جلسة
@@ -253,9 +303,122 @@ switch ($action) {
         db()->prepare(
             'UPDATE users SET tfa_enabled = 0, tfa_secret = NULL, tfa_enabled_at = NULL WHERE id = ?'
         )->execute([$auth['sub']]);
+        // ✅ تعطيل 2FA يُبطل أيضاً كل رموز الاسترداد المرتبطة به — لا معنى
+        // لبقائها صالحة لحساب لم يعد 2FA مفروضاً عليه أصلاً.
+        db()->prepare('DELETE FROM tfa_backup_codes WHERE user_id = ?')->execute([$auth['sub']]);
 
         audit('تعطيل المصادقة الثنائية (2FA)', $auth['email'] ?? null, 'warning', tenant_id_from_auth($auth));
         json_ok(['success' => true]);
+        break;
+
+    // ✅ تغيير كلمة المرور (مستخدم مسجّل دخوله فعلاً) — يتطلب تأكيد كلمة
+    // المرور الحالية (نفس نمط disable_2fa/regenerate_backup_codes) لمنع أي
+    // شخص لديه وصول جسدي لجهاز مفتوح/جلسة مسروقة من تغيير كلمة المرور دون
+    // معرفة القديمة. لا صلة بمسار الاستعادة (password_recovery.php) المُخصَّص
+    // لحالة عدم تسجيل الدخول أصلاً (OTP عبر Email/SMS).
+    case 'change_password':
+        if ($method !== 'POST') json_error('استخدم POST', 405);
+        $auth = require_auth();
+        $body = input_json();
+        $currentPass = (string)($body['current_password'] ?? '');
+        $newPass = (string)($body['new_password'] ?? '');
+        if ($currentPass === '') json_error('كلمة المرور الحالية مطلوبة');
+        if ($newPass === '') json_error('كلمة المرور الجديدة مطلوبة');
+
+        $ip = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+        rl_check('change_password', ($auth['email'] ?? '') . '|' . $ip, 5, 900);
+
+        $stmt = db()->prepare('SELECT password_hash FROM users WHERE id = ? LIMIT 1');
+        $stmt->execute([$auth['sub']]);
+        $row = $stmt->fetch();
+        // ✅ 400 (لا 401) — الجلسة صالحة، الخطأ فقط في كلمة المرور الحالية
+        // المُدخَلة للتأكيد (نفس منطق disable_2fa أعلاه).
+        if (!$row || !password_verify($currentPass, $row['password_hash'] ?? '')) {
+            usleep(300000);
+            json_error('كلمة المرور الحالية غير صحيحة', 400);
+        }
+
+        $pwError = validate_password_strength($newPass);
+        if ($pwError !== null) json_error($pwError);
+
+        rl_clear('change_password', ($auth['email'] ?? '') . '|' . $ip);
+
+        $newHash = password_hash($newPass, PASSWORD_BCRYPT, ['cost' => 12]);
+        db()->prepare('UPDATE users SET password_hash = ? WHERE id = ?')
+            ->execute([$newHash, $auth['sub']]);
+
+        // 🔐 إجراء أمني مهم: إبطال كل الجلسات الأخرى فوراً بعد تغيير كلمة
+        // المرور (نفس ما يحدث في تدفّق استعادة كلمة المرور) — يمنع أي جلسة
+        // مسروقة قديمة من الاستمرار صالحة بعد أن غيّر المستخدم كلمة مروره
+        // تحديداً لهذا السبب. تبقى جلسة هذا الطلب الحالي (التوكن الحالي)
+        // صالحة حتى لا يُقطَع اتصال المستخدم فوراً بعد تنفيذ العملية بنفسه.
+        try {
+            $currentHash = hash('sha256', (string)bearer_token());
+            db()->prepare(
+                'UPDATE user_sessions SET revoked = 1 WHERE user_email = ? AND token_hash != ?'
+            )->execute([$auth['email'] ?? '', $currentHash]);
+        } catch (Exception $e) { /* تجاهل بأمان — best-effort */ }
+
+        audit('تغيير كلمة المرور', $auth['email'] ?? null, 'warning', tenant_id_from_auth($auth));
+        json_ok(['success' => true]);
+        break;
+
+    // ✅ تحديث البيانات الأساسية للمستخدم (الاسم حالياً فقط) — البريد
+    // الإلكتروني مقصود عدم السماح بتغييره من هنا لأنه المعرّف الأساسي
+    // لتسجيل الدخول ومرتبط بجلسات/صلاحيات كثيرة. هذا الإجراء بسيط ولا
+    // يتطلب تأكيد كلمة مرور (لا يغيّر شيئاً حساساً أمنياً) على عكس
+    // change_password/disable_2fa/regenerate_backup_codes أعلاه.
+    case 'update_profile':
+        if ($method !== 'POST') json_error('استخدم POST', 405);
+        $auth = require_auth();
+        $body = input_json();
+        $name = trim((string)($body['name'] ?? ''));
+        if ($name === '') json_error('الاسم مطلوب');
+        if (mb_strlen($name) > 100) json_error('الاسم طويل جداً');
+
+        db()->prepare('UPDATE users SET name = ? WHERE id = ?')
+            ->execute([$name, $auth['sub']]);
+
+        audit('تحديث البيانات الأساسية للملف الشخصي', $auth['email'] ?? null, 'info', tenant_id_from_auth($auth));
+        json_ok(['success' => true, 'name' => $name]);
+        break;
+
+    // ✅ إعادة توليد رموز الاسترداد الاحتياطية — يُبطل الرموز القديمة فوراً
+    // (حتى غير المُستخدَمة منها) ويُنشئ 10 رموز جديدة. يتطلب تأكيد كلمة
+    // المرور الحالية لنفس سبب disable_2fa (منع أي شخص لديه وصول جسدي لجهاز
+    // مفتوح من سرقة/كشف رموز الاسترداد دون معرفة كلمة المرور).
+    case 'regenerate_backup_codes':
+        if ($method !== 'POST') json_error('استخدم POST', 405);
+        $auth = require_auth();
+        $body = input_json();
+        $pass = (string)($body['password'] ?? '');
+        if ($pass === '') json_error('كلمة المرور الحالية مطلوبة لإعادة توليد الرموز الاحتياطية');
+
+        $ip = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+        rl_check('regenerate_backup_codes', ($auth['email'] ?? '') . '|' . $ip, 5, 900);
+
+        $stmt = db()->prepare('SELECT password_hash, tfa_enabled FROM users WHERE id = ? LIMIT 1');
+        $stmt->execute([$auth['sub']]);
+        $row = $stmt->fetch();
+        if (!$row || !password_verify($pass, $row['password_hash'] ?? '')) {
+            usleep(300000);
+            json_error('كلمة المرور غير صحيحة', 400);
+        }
+        if (empty($row['tfa_enabled'])) {
+            json_error('المصادقة الثنائية غير مفعَّلة على هذا الحساب', 400);
+        }
+        rl_clear('regenerate_backup_codes', ($auth['email'] ?? '') . '|' . $ip);
+
+        $backupCodes = replace_backup_codes((int)$auth['sub']);
+        audit('إعادة توليد رموز الاسترداد الاحتياطية (2FA)', $auth['email'] ?? null, 'info', tenant_id_from_auth($auth));
+        json_ok(['success' => true, 'backup_codes' => $backupCodes]);
+        break;
+
+    // ✅ عدد رموز الاسترداد المتبقية غير المُستهلَكة — لعرضها في شاشة الإعدادات
+    case 'backup_codes_status':
+        if ($method !== 'GET') json_error('استخدم GET', 405);
+        $auth = require_auth();
+        json_ok(['success' => true, 'remaining' => count_remaining_backup_codes((int)$auth['sub'])]);
         break;
 
     case 'register':
