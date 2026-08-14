@@ -271,13 +271,46 @@ switch ($method) {
             $stmt->execute([$id, $name, $type, $currency, $balance, $accountNumber, $bankName, $notes, $tenantId]);
             audit("create cash account $id ($name)", null, 'info', $tenantId);
         } else {
-            $stmt = $pdo->prepare(
-                'UPDATE cash_accounts SET
-                    name = ?, type = ?, currency = ?, account_number = ?, bank_name = ?, notes = ?
-                 WHERE id = ? AND tenant_id = ?'
-            );
-            $stmt->execute([$name, $type, $currency, $accountNumber, $bankName, $notes, $id, $tenantId]);
-            if ($stmt->rowCount() === 0) json_error('الحساب غير موجود في متجرك', 404);
+            // 🔧 إصلاح جوهري خطير (فحص شامل لنظام الصناديق والبنوك — إعادة
+            // تسمية عملة الحساب دون تحويل فعلي): كان تعديل حساب موجود يسمح
+            // بتغيير حقل "currency" بلا قيد مطلقاً — بلا فحص لرصيد الحساب
+            // الحالي وبلا أي تحويل فعلي للقيمة. لو استُدعي هذا المسار (حتى
+            // لو لم تعرضه الواجهة الحالية أي شاشة "تعديل" — قد يُستدعى مباشرة
+            // عبر API)، يمكن "تحويل" حساب رصيده 500 دولار مثلاً إلى عملة
+            // "YER" بضغطة واحدة فيصبح رصيده ٥٠٠ ريال يمني فقط — بلا أي تحويل
+            // حسابي حقيقي، أي إفساد فوري وصامت لقيمة الحساب الفعلية. الإصلاح:
+            // قفل صف الحساب أولاً (FOR UPDATE)، ثم رفض تغيير العملة إن كان
+            // رصيده الحالي ≠ صفر — تماماً كما تُمنع عمليات تحويل الأموال بين
+            // عملتين مختلفتين في مسار action=transfer أعلاه.
+            // ملاحظة: نُغلِّف الفحص + التحديث بمعاملة صريحة (beginTransaction)
+            // لأن SELECT ... FOR UPDATE خارج معاملة صريحة في PostgreSQL/PDO
+            // (وضع autocommit الافتراضي) يُحرَّر القفل فوراً بمجرد انتهاء تلك
+            // الجملة نفسها، فلا يمنع فعلياً سباقاً بين طلبي تعديل متزامنين على
+            // نفس الحساب. المعاملة الصريحة تُبقي القفل حتى commit/rollback.
+            $pdo->beginTransaction();
+            try {
+                $curStmt = $pdo->prepare('SELECT * FROM cash_accounts WHERE id = ? AND tenant_id = ? LIMIT 1 FOR UPDATE');
+                $curStmt->execute([$id, $tenantId]);
+                $curAcc = $curStmt->fetch();
+                if (!$curAcc) throw new Exception('الحساب غير موجود في متجرك');
+                if ($curAcc['currency'] !== $currency && (float)$curAcc['balance'] !== 0.0) {
+                    throw new Exception(
+                        'لا يمكن تغيير عملة الحساب (' . $curAcc['currency'] . ' → ' . $currency
+                        . ') لأن رصيده الحالي ليس صفراً — قم بتصفير الرصيد (سحب/تحويل) أولاً'
+                    );
+                }
+                $stmt = $pdo->prepare(
+                    'UPDATE cash_accounts SET
+                        name = ?, type = ?, currency = ?, account_number = ?, bank_name = ?, notes = ?
+                     WHERE id = ? AND tenant_id = ?'
+                );
+                $stmt->execute([$name, $type, $currency, $accountNumber, $bankName, $notes, $id, $tenantId]);
+                if ($stmt->rowCount() === 0) throw new Exception('الحساب غير موجود في متجرك');
+                $pdo->commit();
+            } catch (Exception $e) {
+                $pdo->rollBack();
+                json_error($e->getMessage() ?: 'فشل تحديث الحساب', $e->getMessage() === 'الحساب غير موجود في متجرك' ? 404 : 400);
+            }
             audit("update cash account $id ($name)", null, 'info', $tenantId);
         }
         json_ok(['success' => true, 'id' => $id]);
@@ -292,9 +325,35 @@ switch ($method) {
         $tenantId = tenant_id_from_auth($auth);
         $id = $_GET['id'] ?? '';
         if ($id === '') json_error('id مطلوب');
-        $upd = $pdo->prepare('UPDATE cash_accounts SET is_active = FALSE WHERE id = ? AND tenant_id = ?');
-        $upd->execute([$id, $tenantId]);
-        if ($upd->rowCount() === 0) json_error('الحساب غير موجود في متجرك', 404);
+
+        // 🔧 إصلاح جوهري (فحص شامل لنظام الصناديق والبنوك — فقدان ظاهري
+        // للبيانات): كانت الواجهة (cashboxes_screen.dart) تمنع بالفعل حذف
+        // حساب رصيده غير صفري (onLongPress مقيَّد بـ balance == 0)، لكن هذا
+        // الـ endpoint نفسه كان يقبل تعطيل (soft-delete عبر is_active=FALSE)
+        // أي حساب بغض النظر عن رصيده الحالي إن استُدعي مباشرة (مثلاً عبر
+        // طلب API مباشر بصلاحية مدير، متجاوزاً الواجهة). النتيجة: حساب
+        // برصيد غير صفري يختفي فوراً من قائمة الحسابات (GET يُصفّي
+        // is_active = TRUE) ومن totalCashBalance رغم بقاء رصيده الفعلي في
+        // قاعدة البيانات — أي "اختفاء" ظاهري لأموال حقيقية من منظور
+        // المستخدم. الإصلاح: قفل الصف (FOR UPDATE) والتحقق من أن الرصيد
+        // صفر قبل التعطيل — طبقة حماية خادم مطابقة لحارس الواجهة.
+        $pdo->beginTransaction();
+        try {
+            $lockStmt = $pdo->prepare('SELECT * FROM cash_accounts WHERE id = ? AND tenant_id = ? LIMIT 1 FOR UPDATE');
+            $lockStmt->execute([$id, $tenantId]);
+            $acc = $lockStmt->fetch();
+            if (!$acc) throw new Exception('الحساب غير موجود في متجرك');
+            if ((float)$acc['balance'] !== 0.0) {
+                throw new Exception('لا يمكن حذف حساب رصيده غير صفري — قم بتحويل/سحب الرصيد أولاً');
+            }
+            $upd = $pdo->prepare('UPDATE cash_accounts SET is_active = FALSE WHERE id = ? AND tenant_id = ?');
+            $upd->execute([$id, $tenantId]);
+            if ($upd->rowCount() === 0) throw new Exception('الحساب غير موجود في متجرك');
+            $pdo->commit();
+        } catch (Exception $e) {
+            $pdo->rollBack();
+            json_error($e->getMessage() ?: 'فشل حذف الحساب', $e->getMessage() === 'الحساب غير موجود في متجرك' ? 404 : 400);
+        }
         audit("deactivate cash account $id", null, 'warning', $tenantId);
         json_ok(['success' => true]);
         break;
