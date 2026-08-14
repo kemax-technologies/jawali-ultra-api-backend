@@ -86,6 +86,9 @@ switch ($method) {
             }
             if ($fromId === $toId) json_error('لا يمكن التحويل لنفس الحساب');
 
+            // فحص أولي سريع خارج المعاملة (تجربة مستخدم فقط — رسالة خطأ سريعة
+            // إن كان الحساب غير موجود أو الرصيد غير كافٍ في الحالة العادية).
+            // الفحص الحاسم الفعلي (قفل الصف + إعادة التحقق) يتم داخل المعاملة.
             $fromStmt = $pdo->prepare('SELECT * FROM cash_accounts WHERE id = ? AND tenant_id = ? LIMIT 1');
             $fromStmt->execute([$fromId, $tenantId]);
             $from = $fromStmt->fetch();
@@ -111,8 +114,35 @@ switch ($method) {
 
             $pdo->beginTransaction();
             try {
-                $pdo->prepare('UPDATE cash_accounts SET balance = balance - ? WHERE id = ? AND tenant_id = ?')
-                    ->execute([$amount, $fromId, $tenantId]);
+                // 🔧 إصلاح جوهري خطير (فحص شامل لنظام الصناديق والبنوك — منع
+                // الازدواجية/التعارض في البيانات): كان فحص كفاية الرصيد يتم
+                // بـ SELECT عادي *قبل* بدء المعاملة بلا قفل صف (FOR UPDATE)،
+                // وجملة UPDATE اللاحقة "balance = balance - ?" تُنفَّذ بلا أي
+                // شرط على الرصيد الحالي. النتيجة: طلبا تحويل متزامنان من نفس
+                // الحساب المصدر (رصيده يكفي لتحويل واحد فقط) يمكن أن يجتازا
+                // كلاهما الفحص الأولي معاً قبل أن يُنهي أيٌّ منهما معاملته،
+                // فيُخصَم المبلغ *مرتين* ويصبح رصيد الحساب سالباً بشكل غير
+                // صحيح (سحب مزدوج / ازدواجية مالية حقيقية). الإصلاح: قفل صف
+                // الحساب المصدر بـ SELECT ... FOR UPDATE داخل المعاملة، إعادة
+                // التحقق من كفاية الرصيد على القيمة "الطازجة" بعد القفل، ثم
+                // تنفيذ UPDATE بشرط "balance >= amount" صراحة في WHERE مع فحص
+                // rowCount() كحماية أخيرة (defense in depth) — فإن نفّذ طلب
+                // مزامن آخر الخصم أولاً وأصبح الرصيد غير كافٍ، لن يُحدَّث أي
+                // صف ويُرفض الطلب الثاني بأمان بدل تنفيذه خطأً.
+                $lockStmt = $pdo->prepare('SELECT * FROM cash_accounts WHERE id = ? AND tenant_id = ? LIMIT 1 FOR UPDATE');
+                $lockStmt->execute([$fromId, $tenantId]);
+                $freshFrom = $lockStmt->fetch();
+                if (!$freshFrom || (float)$freshFrom['balance'] < $amount) {
+                    throw new Exception('الرصيد غير كافٍ في الحساب المصدر');
+                }
+
+                $outUpd = $pdo->prepare(
+                    'UPDATE cash_accounts SET balance = balance - ? WHERE id = ? AND tenant_id = ? AND balance >= ?'
+                );
+                $outUpd->execute([$amount, $fromId, $tenantId, $amount]);
+                if ($outUpd->rowCount() === 0) {
+                    throw new Exception('الرصيد غير كافٍ في الحساب المصدر');
+                }
                 $pdo->prepare('UPDATE cash_accounts SET balance = balance + ? WHERE id = ? AND tenant_id = ?')
                     ->execute([$amount, $toId, $tenantId]);
 
@@ -154,27 +184,65 @@ switch ($method) {
             $notes = $body['notes'] ?? '';
             if ($accId === '' || $amount <= 0) json_error('account_id و amount مطلوبة');
 
+            // فحص أولي سريع خارج المعاملة (تجربة مستخدم فقط). الفحص الحاسم
+            // الفعلي (قفل الصف + إعادة التحقق) يتم أدناه داخل المعاملة.
             $accStmt = $pdo->prepare('SELECT * FROM cash_accounts WHERE id = ? AND tenant_id = ? LIMIT 1');
             $accStmt->execute([$accId, $tenantId]);
             $acc = $accStmt->fetch();
             if (!$acc) json_error('الحساب غير موجود', 404);
-
-            $delta = ($type === 'سحب') ? -$amount : $amount;
             if ($type === 'سحب' && (float)$acc['balance'] < $amount) {
                 json_error('الرصيد غير كافٍ');
             }
 
-            $pdo->prepare('UPDATE cash_accounts SET balance = balance + ? WHERE id = ? AND tenant_id = ?')
-                ->execute([$delta, $accId, $tenantId]);
-
             $txId = 'TX-' . round(microtime(true) * 1000);
-            $pdo->prepare(
-                'INSERT INTO cash_transactions (id, account_id, type, amount, currency, notes, created_by, tenant_id)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
-            )->execute([
-                $txId, $accId, $type, $amount, $acc['currency'], $notes,
-                $_SERVER['HTTP_X_USER_EMAIL'] ?? null, $tenantId,
-            ]);
+
+            // 🔧 إصلاح جوهري خطير (فحص شامل لنظام الصناديق والبنوك — منع
+            // الازدواجية/التعارض في البيانات): كانت هذه العملية بأكملها بلا
+            // beginTransaction/commit إطلاقاً — أي أن UPDATE (تحديث الرصيد)
+            // وINSERT (تسجيل الحركة) عمليتان منفصلتان تماماً بلا التفاف ذرّي؛
+            // فشل الـ INSERT بعد نجاح الـ UPDATE (مثلاً انقطاع اتصال) كان
+            // يترك الرصيد مُحدَّثاً بدون أي سجل حركة يوثّقه — فقدان تكامل
+            // بيانات. إضافة لذلك، فحص كفاية الرصيد للسحب كان يتم بلا قفل صف،
+            // فطلبا سحب متزامنان (رصيد يكفي لأحدهما فقط) كانا يمكن أن ينجحا
+            // معاً ويُصبح الرصيد سالباً. الإصلاح: تغليف الخصم/الإضافة والتسجيل
+            // بمعاملة واحدة، مع قفل صف الحساب (FOR UPDATE) وإعادة التحقق من
+            // كفاية الرصيد قبل السحب تحديداً، وأخيراً شرط "balance >= amount"
+            // صريح في WHERE الخاص بـ UPDATE السحب (دفاع أخير عبر rowCount()).
+            $pdo->beginTransaction();
+            try {
+                $lockStmt = $pdo->prepare('SELECT * FROM cash_accounts WHERE id = ? AND tenant_id = ? LIMIT 1 FOR UPDATE');
+                $lockStmt->execute([$accId, $tenantId]);
+                $freshAcc = $lockStmt->fetch();
+                if (!$freshAcc) throw new Exception('الحساب غير موجود');
+
+                if ($type === 'سحب') {
+                    if ((float)$freshAcc['balance'] < $amount) {
+                        throw new Exception('الرصيد غير كافٍ');
+                    }
+                    $upd = $pdo->prepare(
+                        'UPDATE cash_accounts SET balance = balance - ? WHERE id = ? AND tenant_id = ? AND balance >= ?'
+                    );
+                    $upd->execute([$amount, $accId, $tenantId, $amount]);
+                    if ($upd->rowCount() === 0) throw new Exception('الرصيد غير كافٍ');
+                } else {
+                    $pdo->prepare('UPDATE cash_accounts SET balance = balance + ? WHERE id = ? AND tenant_id = ?')
+                        ->execute([$amount, $accId, $tenantId]);
+                }
+
+                $pdo->prepare(
+                    'INSERT INTO cash_transactions (id, account_id, type, amount, currency, notes, created_by, tenant_id)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+                )->execute([
+                    $txId, $accId, $type, $amount, $freshAcc['currency'], $notes,
+                    $_SERVER['HTTP_X_USER_EMAIL'] ?? null, $tenantId,
+                ]);
+
+                $pdo->commit();
+            } catch (Exception $e) {
+                $pdo->rollBack();
+                error_log('[Jawali][cashboxes] فشل الإيداع/السحب: ' . $e->getMessage());
+                json_error($e->getMessage() ?: 'فشل تنفيذ العملية', 500);
+            }
 
             audit("cash $type on $accId amount=$amount", null, 'info', $tenantId);
             json_ok(['success' => true, 'id' => $txId]);

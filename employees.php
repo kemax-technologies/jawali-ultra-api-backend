@@ -90,7 +90,13 @@ switch ($method) {
                 $pdo->beginTransaction();
 
                 if ($cashAccountId !== '') {
-                    $accStmt = $pdo->prepare('SELECT * FROM cash_accounts WHERE id = ? AND tenant_id = ? LIMIT 1');
+                    // 🔧 إصلاح جوهري خطير (فحص شامل لنظام الصناديق والبنوك —
+                    // منع الازدواجية/التعارض في البيانات): نفس نمط ثغرة السباق
+                    // الموثّقة في cashboxes.php/vouchers.php/transfers.php —
+                    // قفل الصف بـ FOR UPDATE واشتراط "balance >= netAmount"
+                    // صراحة في WHERE الخاص بالخصم (مع فحص rowCount()) لمنع صرف
+                    // راتبين متزامنين من نفس الصندوق من إفراغه لرصيد سالب.
+                    $accStmt = $pdo->prepare('SELECT * FROM cash_accounts WHERE id = ? AND tenant_id = ? LIMIT 1 FOR UPDATE');
                     $accStmt->execute([$cashAccountId, $tenantId]);
                     $acc = $accStmt->fetch();
                     if (!$acc) {
@@ -112,8 +118,14 @@ switch ($method) {
                         $pdo->rollBack();
                         json_error('الرصيد غير كافٍ في الصندوق المحدد لصرف الراتب');
                     }
-                    $pdo->prepare('UPDATE cash_accounts SET balance = balance - ? WHERE id = ? AND tenant_id = ?')
-                        ->execute([$netAmount, $cashAccountId, $tenantId]);
+                    $updAcc = $pdo->prepare(
+                        'UPDATE cash_accounts SET balance = balance - ? WHERE id = ? AND tenant_id = ? AND balance >= ?'
+                    );
+                    $updAcc->execute([$netAmount, $cashAccountId, $tenantId, $netAmount]);
+                    if ($updAcc->rowCount() === 0) {
+                        $pdo->rollBack();
+                        json_error('الرصيد غير كافٍ في الصندوق المحدد لصرف الراتب');
+                    }
 
                     $txId = 'TX-' . round(microtime(true) * 1000);
                     $pdo->prepare(

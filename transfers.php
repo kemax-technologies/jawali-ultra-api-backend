@@ -92,20 +92,49 @@ switch ($method) {
             $payoutAccountId = trim($body['payout_cash_account_id'] ?? $body['payoutCashAccountId'] ?? '');
             if ($code === '') json_error('رمز الاستلام مطلوب');
 
+            // فحص أولي سريع خارج المعاملة (تجربة مستخدم فقط — رسالة 404 سريعة
+            // إن كان الرمز غير موجود إطلاقاً). الفحص الحاسم الفعلي يتم أدناه
+            // داخل المعاملة مع قفل الصف.
             $stmt = $pdo->prepare(
-                "SELECT * FROM money_transfers WHERE receive_code = ? AND status = 'pending' AND tenant_id = ? LIMIT 1"
+                "SELECT id FROM money_transfers WHERE receive_code = ? AND status = 'pending' AND tenant_id = ? LIMIT 1"
             );
             $stmt->execute([$code, $tenantId]);
-            $tr = $stmt->fetch();
-            if (!$tr) json_error('لم يُعثر على تحويل معلّق بهذا الرمز', 404);
+            if (!$stmt->fetch()) json_error('لم يُعثر على تحويل معلّق بهذا الرمز', 404);
 
             $pdo->beginTransaction();
             try {
-                $pdo->prepare(
+                // 🔧 إصلاح جوهري خطير (فحص شامل لنظام الصناديق والبنوك — منع
+                // الازدواجية/التعارض في البيانات): كان الفحص عن status='pending'
+                // يتم بـ SELECT عادي *قبل* بدء المعاملة وبدون قفل صف (FOR UPDATE)،
+                // وجملة UPDATE اللاحقة لا تُعيد التحقق من status='pending' في
+                // شرط WHERE. النتيجة: طلبان متزامنان لنفس رمز الاستلام (مثلاً
+                // ضغط مزدوج على زر "صرف" أو محاولة صرف من جهازين) يمكن أن
+                // يجتازا كلاهما الفحص الأولي قبل أن يُنهي أيٌّ منهما معاملته،
+                // فيُنفَّذ خصم مبلغ التحويل من صندوق الصرف *مرتين* لتحويل واحد
+                // فقط — ازدواجية مالية حقيقية. الإصلاح: قفل الصف ذرياً
+                // بـ SELECT ... FOR UPDATE داخل المعاملة، ثم إعادة التحقق من
+                // status='pending' مباشرة قبل أي تعديل، وأخيراً اشتراط
+                // status='pending' في شرط WHERE الخاص بجملة UPDATE نفسها مع
+                // فحص rowCount() — فإن نفّذ طلب مزامن آخر التحديث أولاً، فلن
+                // يُحدَّث أي صف (rowCount=0) ويُرفض الطلب الثاني بأمان.
+                $lockStmt = $pdo->prepare(
+                    "SELECT * FROM money_transfers WHERE receive_code = ? AND tenant_id = ? LIMIT 1 FOR UPDATE"
+                );
+                $lockStmt->execute([$code, $tenantId]);
+                $tr = $lockStmt->fetch();
+                if (!$tr || $tr['status'] !== 'pending') {
+                    throw new Exception('لم يُعثر على تحويل معلّق بهذا الرمز — قد يكون صُرف بالفعل');
+                }
+
+                $upd = $pdo->prepare(
                     "UPDATE money_transfers
                      SET status = 'completed', completed_by = ?, completed_at = NOW(), payout_cash_account_id = ?
-                     WHERE id = ? AND tenant_id = ?"
-                )->execute([$userEmail, $payoutAccountId ?: null, $tr['id'], $tenantId]);
+                     WHERE id = ? AND tenant_id = ? AND status = 'pending'"
+                );
+                $upd->execute([$userEmail, $payoutAccountId ?: null, $tr['id'], $tenantId]);
+                if ($upd->rowCount() === 0) {
+                    throw new Exception('تم صرف هذا التحويل بالفعل من طلب آخر');
+                }
 
                 // إذا حُدِّد صندوق صرف، يُخصَم منه مبلغ التحويل الأساسي (بدون العمولة
                 // لأن العمولة إيراد وليست جزءاً من المبلغ المطلوب صرفه للمستلم)
@@ -170,15 +199,36 @@ switch ($method) {
             $id = trim($body['id'] ?? '');
             if ($id === '') json_error('id مطلوب');
 
-            $stmt = $pdo->prepare("SELECT * FROM money_transfers WHERE id = ? AND status = 'pending' AND tenant_id = ? LIMIT 1");
+            // فحص أولي سريع خارج المعاملة (تجربة مستخدم فقط). الفحص الحاسم
+            // الفعلي (قفل الصف + إعادة التحقق) يتم أدناه داخل المعاملة.
+            $stmt = $pdo->prepare("SELECT id FROM money_transfers WHERE id = ? AND status = 'pending' AND tenant_id = ? LIMIT 1");
             $stmt->execute([$id, $tenantId]);
-            $tr = $stmt->fetch();
-            if (!$tr) json_error('التحويل غير موجود أو ليس معلّقاً', 404);
+            if (!$stmt->fetch()) json_error('التحويل غير موجود أو ليس معلّقاً', 404);
 
             $pdo->beginTransaction();
             try {
-                $pdo->prepare("UPDATE money_transfers SET status = 'cancelled', completed_by = ?, completed_at = NOW() WHERE id = ? AND tenant_id = ?")
-                    ->execute([$userEmail, $id, $tenantId]);
+                // 🔧 إصلاح جوهري خطير (فحص شامل لنظام الصناديق والبنوك — منع
+                // الازدواجية/التعارض في البيانات): نفس ثغرة السباق الموثّقة في
+                // مسار action=complete أعلاه — طلبا إلغاء متزامنان لنفس
+                // التحويل (مثلاً ضغط مزدوج على زر "إلغاء") كانا يمكن أن
+                // يجتازا كلاهما فحص status='pending' قبل تحديث أي منهما
+                // للسجل، فيُخصَم مبلغ "total" من صندوق الإرسال *مرتين* رغم
+                // أن التحويل واحد فقط. الإصلاح: قفل الصف بـ FOR UPDATE داخل
+                // المعاملة، إعادة التحقق من status='pending'، ثم اشتراط
+                // status='pending' في شرط WHERE الخاص بـ UPDATE مع فحص
+                // rowCount() لرفض أي محاولة إلغاء ثانية بأمان.
+                $lockStmt = $pdo->prepare('SELECT * FROM money_transfers WHERE id = ? AND tenant_id = ? LIMIT 1 FOR UPDATE');
+                $lockStmt->execute([$id, $tenantId]);
+                $tr = $lockStmt->fetch();
+                if (!$tr || $tr['status'] !== 'pending') {
+                    throw new Exception('التحويل غير موجود أو ليس معلّقاً — قد يكون أُلغي/صُرف بالفعل');
+                }
+
+                $upd = $pdo->prepare("UPDATE money_transfers SET status = 'cancelled', completed_by = ?, completed_at = NOW() WHERE id = ? AND tenant_id = ? AND status = 'pending'");
+                $upd->execute([$userEmail, $id, $tenantId]);
+                if ($upd->rowCount() === 0) {
+                    throw new Exception('تم إلغاء/صرف هذا التحويل بالفعل من طلب آخر');
+                }
 
                 // 🔧 إصلاح جوهري خطير (فحص شامل لنظام الصناديق والبنوك):
                 // عند إنشاء التحويل يُضاف "total" لصندوق الإرسال لأن العميل
@@ -304,7 +354,10 @@ switch ($method) {
 
         $pdo->beginTransaction();
         try {
-            $stmt = $pdo->prepare('SELECT * FROM money_transfers WHERE id = ? AND tenant_id = ? LIMIT 1');
+            // 🔧 إصلاح جوهري (فحص شامل لنظام الصناديق والبنوك — منع
+            // الازدواجية/التعارض في البيانات): قفل صف التحويل بـ FOR UPDATE
+            // لمنع حذفين متزامنين لنفس السجل من عكس أثره المالي مرتين.
+            $stmt = $pdo->prepare('SELECT * FROM money_transfers WHERE id = ? AND tenant_id = ? LIMIT 1 FOR UPDATE');
             $stmt->execute([$id, $tenantId]);
             $tr = $stmt->fetch();
             if (!$tr) {

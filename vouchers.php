@@ -79,7 +79,17 @@ switch ($method) {
 
             // إذا مرتبط بصندوق: حدّث الرصيد + سجل حركة صندوق
             if ($cashAccountId !== '') {
-                $accStmt = $pdo->prepare('SELECT * FROM cash_accounts WHERE id = ? AND tenant_id = ? LIMIT 1');
+                // 🔧 إصلاح جوهري خطير (فحص شامل لنظام الصناديق والبنوك — منع
+                // الازدواجية/التعارض في البيانات): كان الفحص عن الصندوق/كفاية
+                // الرصيد يتم بـ SELECT عادي بلا قفل صف (FOR UPDATE)، وجملة
+                // UPDATE اللاحقة تُنفَّذ بلا أي شرط على الرصيد الحالي في
+                // WHERE. نفس نمط ثغرة السباق الموثّقة في cashboxes.php أعلاه:
+                // طلبا سند صرف متزامنان من نفس الصندوق (رصيده يكفي لسند واحد
+                // فقط) كانا يمكن أن يجتازا فحص الكفاية معاً فيصبح الرصيد
+                // سالباً. الإصلاح: قفل الصف بـ FOR UPDATE، ولسند الصرف تحديداً
+                // اشتراط "balance >= amount" صراحة في WHERE مع فحص rowCount()
+                // كدفاع أخير.
+                $accStmt = $pdo->prepare('SELECT * FROM cash_accounts WHERE id = ? AND tenant_id = ? LIMIT 1 FOR UPDATE');
                 $accStmt->execute([$cashAccountId, $tenantId]);
                 $acc = $accStmt->fetch();
                 if (!$acc) {
@@ -106,8 +116,19 @@ switch ($method) {
                 }
 
                 $delta = ($type === 'receipt') ? $amount : -$amount;
-                $pdo->prepare('UPDATE cash_accounts SET balance = balance + ? WHERE id = ? AND tenant_id = ?')
-                    ->execute([$delta, $cashAccountId, $tenantId]);
+                if ($type === 'payment') {
+                    $updAcc = $pdo->prepare(
+                        'UPDATE cash_accounts SET balance = balance + ? WHERE id = ? AND tenant_id = ? AND balance >= ?'
+                    );
+                    $updAcc->execute([$delta, $cashAccountId, $tenantId, $amount]);
+                    if ($updAcc->rowCount() === 0) {
+                        $pdo->rollBack();
+                        json_error('الرصيد غير كافٍ في الصندوق المحدد');
+                    }
+                } else {
+                    $pdo->prepare('UPDATE cash_accounts SET balance = balance + ? WHERE id = ? AND tenant_id = ?')
+                        ->execute([$delta, $cashAccountId, $tenantId]);
+                }
 
                 $txId = 'TX-' . round(microtime(true) * 1000);
                 $pdo->prepare(
@@ -162,7 +183,14 @@ switch ($method) {
 
         try {
             $pdo->beginTransaction();
-            $stmt = $pdo->prepare('SELECT * FROM vouchers WHERE id = ? AND tenant_id = ? LIMIT 1');
+            // 🔧 إصلاح جوهري (فحص شامل لنظام الصناديق والبنوك — منع
+            // الازدواجية/التعارض في البيانات): قفل صف السند بـ FOR UPDATE —
+            // بدونه، طلبا حذف متزامنان لنفس السند (نادر لكن ممكن) كانا
+            // يمكن أن يقرآ نفس البيانات معاً قبل حذف أيٍّ منهما للسجل،
+            // فيُعكَس أثر السند على رصيد الصندوق *مرتين* رغم وجود سند واحد
+            // فقط. القفل يجعل الطلب الثاني ينتظر انتهاء معاملة الأول، وعندها
+            // لن يجد السند (محذوف بالفعل) ويُرفض بأمان بخطأ 404.
+            $stmt = $pdo->prepare('SELECT * FROM vouchers WHERE id = ? AND tenant_id = ? LIMIT 1 FOR UPDATE');
             $stmt->execute([$id, $tenantId]);
             $v = $stmt->fetch();
             if (!$v) {
