@@ -64,13 +64,45 @@ switch ($method) {
             // 💰 المرحلة 7: إذا كانت المشتريات نقدية ومرتبطة بصندوق، اخصم المبلغ
             // من رصيد الصندوق تلقائياً + سجّل حركة صندوق (المشتريات الآجلة لا
             // تُخصم هنا لأنها تُدار عبر رصيد المورد بشكل منفصل)
+            //
+            // 🔧 إصلاح جوهري خطير (فحص شامل لنظام الصناديق والبنوك — عدم تطابق
+            // العملة): لا يوجد حقل "currency" على فاتورة الشراء (كل المبالغ
+            // بالريال اليمني ضمنياً — نفس المشكلة المكتشفة والمُصلَحة للتو في
+            // invoices.php لفواتير البيع)، وقائمة اختيار الصندوق في شاشة
+            // المشتريات (procurement_screen.dart) تعرض كل الصناديق بلا تمييز
+            // للعملة. كان هذا الكود يخصم "$total" (ريال يمني حتماً) حرفياً من
+            // أي صندوق يُختار — لو كان بعملة أخرى (دولار/ريال سعودي) لفسد
+            // رصيده فوراً. الإصلاح: رفض العملية إن كانت عملة الصندوق ليست
+            // "YER".
+            //
+            // 🔧 إصلاح جوهري خطير آخر (ثغرة سباق/Race Condition — قد تجعل
+            // الرصيد سالباً): كان الفحص عن الصندوق يتم بـ SELECT عادي بلا قفل
+            // صف (FOR UPDATE) وبلا أي فحص لكفاية الرصيد قبل الخصم، وجملة
+            // UPDATE لا تشترط أي شيء في WHERE — نفس نمط الثغرة المُصلَحة في
+            // باقي ملفات الصناديق. الإصلاح: قفل الصف، فحص كفاية الرصيد، ثم
+            // اشتراط "balance >= amount" في WHERE مع فحص rowCount() كدفاع
+            // أخير.
             if ($cashAccountId !== '' && $paymentMethod !== 'آجل' && $total > 0) {
-                $accStmt = $pdo->prepare('SELECT * FROM cash_accounts WHERE id = ? AND tenant_id = ? LIMIT 1');
+                $accStmt = $pdo->prepare('SELECT * FROM cash_accounts WHERE id = ? AND tenant_id = ? LIMIT 1 FOR UPDATE');
                 $accStmt->execute([$cashAccountId, $tenantId]);
                 $acc = $accStmt->fetch();
                 if ($acc) {
-                    $pdo->prepare('UPDATE cash_accounts SET balance = balance - ? WHERE id = ? AND tenant_id = ?')
-                        ->execute([$total, $cashAccountId, $tenantId]);
+                    if ($acc['currency'] !== 'YER') {
+                        throw new Exception(
+                            'لا يمكن ربط فاتورة شراء (مبالغها بالريال اليمني ضمنياً) بصندوق بعملة '
+                            . $acc['currency'] . ' — اختر صندوقاً بعملة YER'
+                        );
+                    }
+                    if ((float)$acc['balance'] < $total) {
+                        throw new Exception('الرصيد غير كافٍ في الصندوق المحدد لسداد فاتورة الشراء');
+                    }
+                    $updAcc = $pdo->prepare(
+                        'UPDATE cash_accounts SET balance = balance - ? WHERE id = ? AND tenant_id = ? AND balance >= ?'
+                    );
+                    $updAcc->execute([$total, $cashAccountId, $tenantId, $total]);
+                    if ($updAcc->rowCount() === 0) {
+                        throw new Exception('الرصيد غير كافٍ في الصندوق المحدد لسداد فاتورة الشراء');
+                    }
                     $txId = 'TX-' . round(microtime(true) * 1000);
                     $pdo->prepare(
                         'INSERT INTO cash_transactions (id, tenant_id, account_id, type, amount, currency, notes, created_by)
@@ -86,7 +118,7 @@ switch ($method) {
         } catch (Exception $e) {
             $pdo->rollBack();
             error_log('[Jawali][purchases] فشل حفظ فاتورة الشراء: ' . $e->getMessage());
-            json_error('خطأ داخلي في الخادم', 500);
+            json_error($e->getMessage() ?: 'خطأ داخلي في الخادم', 500);
         }
         audit("purchase $id", null, 'info', $tenantId);
         json_ok(['success' => true, 'id' => $id]);

@@ -66,23 +66,46 @@ switch ($method) {
             $id = trim($_GET['id'] ?? (input_json()['id'] ?? ''));
             if ($id === '') json_error('id مطلوب');
 
-            $stmt = $pdo->prepare('SELECT * FROM invoices WHERE tenant_id = ? AND id = ? LIMIT 1');
+            // فحص أولي سريع خارج المعاملة (تجربة مستخدم فقط). الفحص الحاسم
+            // الفعلي (قفل الصف + إعادة التحقق) يتم أدناه داخل المعاملة.
+            $stmt = $pdo->prepare('SELECT id FROM invoices WHERE tenant_id = ? AND id = ? LIMIT 1');
             $stmt->execute([$tenantId, $id]);
-            $inv = $stmt->fetch();
-            if (!$inv) json_error('الفاتورة غير موجودة', 404);
-            if (($inv['status'] ?? '') === 'ملغاة') {
-                json_error('الفاتورة ملغاة مسبقاً');
-            }
+            if (!$stmt->fetch()) json_error('الفاتورة غير موجودة', 404);
 
             $pdo->beginTransaction();
             try {
+                // 🔧 إصلاح جوهري خطير (فحص شامل لنظام الصناديق والبنوك — منع
+                // الازدواجية/التعارض في البيانات): كان فحص status='ملغاة' يتم
+                // *قبل* بدء المعاملة وبدون قفل صف، وجملة UPDATE اللاحقة لا
+                // تُعيد التحقق من الحالة في WHERE — نفس نمط ثغرة السباق
+                // الموثّقة في transfers.php. طلبا إلغاء متزامنان (أو إلغاء +
+                // حذف متزامنان) لنفس الفاتورة كانا يمكن أن يعكسا أثرها على
+                // الصندوق مرتين. الإصلاح: قفل صف الفاتورة بـ FOR UPDATE،
+                // إعادة التحقق من الحالة، ثم اشتراط status != 'ملغاة' في
+                // WHERE مع فحص rowCount().
+                $lockStmt = $pdo->prepare('SELECT * FROM invoices WHERE tenant_id = ? AND id = ? LIMIT 1 FOR UPDATE');
+                $lockStmt->execute([$tenantId, $id]);
+                $inv = $lockStmt->fetch();
+                if (!$inv) {
+                    throw new Exception('الفاتورة غير موجودة');
+                }
+                if (($inv['status'] ?? '') === 'ملغاة') {
+                    throw new Exception('الفاتورة ملغاة مسبقاً');
+                }
+
                 _reverse_invoice_effects($pdo, $inv, $auth['email'] ?? null, $tenantId);
-                $pdo->prepare("UPDATE invoices SET status = 'ملغاة' WHERE tenant_id = ? AND id = ?")->execute([$tenantId, $id]);
+                $upd = $pdo->prepare(
+                    "UPDATE invoices SET status = 'ملغاة' WHERE tenant_id = ? AND id = ? AND status != 'ملغاة'"
+                );
+                $upd->execute([$tenantId, $id]);
+                if ($upd->rowCount() === 0) {
+                    throw new Exception('تم إلغاء هذه الفاتورة بالفعل من طلب آخر');
+                }
                 $pdo->commit();
             } catch (Exception $e) {
                 $pdo->rollBack();
                 error_log('[Jawali][invoices] فشل إلغاء الفاتورة: ' . $e->getMessage());
-                json_error('خطأ داخلي في الخادم', 500);
+                json_error($e->getMessage() ?: 'خطأ داخلي في الخادم', 500);
             }
             audit("إلغاء فاتورة $id", $auth['email'] ?? null, 'info', $tenantId);
             json_ok(['success' => true, 'id' => $id, 'status' => 'ملغاة']);
@@ -175,11 +198,37 @@ switch ($method) {
             // 💰 المرحلة 11: إذا كانت الفاتورة نقدية ومرتبطة بصندوق، أضف المبلغ
             // تلقائياً لرصيد الصندوق + سجّل حركة صندوق (البيع الآجل لا يُضاف هنا
             // لأنه يُدار عبر نظام الذمم/credits بشكل منفصل)
+            //
+            // 🔧 إصلاح جوهري خطير (فحص شامل لنظام الصناديق والبنوك — عدم تطابق
+            // العملة): لا يوجد أي حقل "currency" على مستوى الفاتورة/المنتجات
+            // إطلاقاً (كل الأسعار والمجاميع بعملة النظام الأساسية "YER"
+            // ضمنياً)، ومع ذلك كانت قائمة اختيار الصندوق في نقطة البيع
+            // (pos_screen.dart) تعرض كل الصناديق بلا تمييز للعملة، وهذا الكود
+            // كان يضيف "$total" (مبلغ بالريال اليمني حتماً) حرفياً لرصيد أي
+            // صندوق — لو اختار المستخدم صندوقاً بعملة أخرى (دولار/ريال سعودي)
+            // لفسد رصيده الفعلي فوراً بلا أي تحويل بسعر الصرف. الإصلاح: رفض
+            // العملية إن كانت عملة الصندوق المحدد ليست "YER" (بما أن كل مبالغ
+            // الفواتير بالريال اليمني ضمنياً) — مطابقةً لنفس نمط الحماية
+            // المطبَّق على السندات/التحويلات/الرواتب.
+            //
+            // 🔧 إصلاح جوهري خطير آخر (ثغرة سباق/Race Condition): كان الفحص عن
+            // الصندوق يتم بـ SELECT عادي بلا قفل صف (FOR UPDATE) قبل التحديث —
+            // نفس نمط الثغرة المُصلَحة في transfers.php/cashboxes.php/vouchers.php/
+            // employees.php. هنا الخطر أقل حدّة (إضافة إلى الرصيد وليس خصماً
+            // قد يجعله سالباً) لكنه لا يزال يمكن أن يُسبّب فقدان تحديث (lost
+            // update) عند فواتير متزامنة على نفس الصندوق. الإصلاح: قفل الصف
+            // بـ FOR UPDATE.
             if ($cashAccountId !== '' && $paymentMethod !== 'آجل' && $total > 0) {
-                $accStmt = $pdo->prepare('SELECT * FROM cash_accounts WHERE tenant_id = ? AND id = ? LIMIT 1');
+                $accStmt = $pdo->prepare('SELECT * FROM cash_accounts WHERE tenant_id = ? AND id = ? LIMIT 1 FOR UPDATE');
                 $accStmt->execute([$tenantId, $cashAccountId]);
                 $acc = $accStmt->fetch();
                 if ($acc) {
+                    if ($acc['currency'] !== 'YER') {
+                        throw new Exception(
+                            'لا يمكن ربط فاتورة بيع (مبالغها بالريال اليمني ضمنياً) بصندوق بعملة '
+                            . $acc['currency'] . ' — اختر صندوقاً بعملة YER'
+                        );
+                    }
                     $pdo->prepare('UPDATE cash_accounts SET balance = balance + ? WHERE tenant_id = ? AND id = ?')
                         ->execute([$total, $tenantId, $cashAccountId]);
                     $txId = 'TX-' . round(microtime(true) * 1000);
@@ -197,7 +246,7 @@ switch ($method) {
         } catch (Exception $e) {
             $pdo->rollBack();
             error_log('[Jawali][invoices] فشل حفظ الفاتورة: ' . $e->getMessage());
-            json_error('خطأ داخلي في الخادم', 500);
+            json_error($e->getMessage() ?: 'خطأ داخلي في الخادم', 500);
         }
         audit("invoice $id", $auth['email'] ?? null, 'info', $tenantId);
         json_ok(['success' => true, 'id' => $id]);
@@ -216,13 +265,29 @@ switch ($method) {
         $id = trim($_GET['id'] ?? '');
         if ($id === '') json_error('id مطلوب');
 
-        $stmt = $pdo->prepare('SELECT * FROM invoices WHERE tenant_id = ? AND id = ? LIMIT 1');
+        // فحص أولي سريع خارج المعاملة (تجربة مستخدم فقط). الفحص الحاسم
+        // الفعلي (قفل الصف + إعادة التحقق) يتم أدناه داخل المعاملة.
+        $stmt = $pdo->prepare('SELECT id FROM invoices WHERE tenant_id = ? AND id = ? LIMIT 1');
         $stmt->execute([$tenantId, $id]);
-        $inv = $stmt->fetch();
-        if (!$inv) json_error('الفاتورة غير موجودة', 404);
+        if (!$stmt->fetch()) json_error('الفاتورة غير موجودة', 404);
 
         $pdo->beginTransaction();
         try {
+            // 🔧 إصلاح جوهري خطير (فحص شامل لنظام الصناديق والبنوك — منع
+            // الازدواجية/التعارض في البيانات): كانت قراءة الفاتورة تتم بلا
+            // قفل صف *قبل* بدء المعاملة — طلب حذف وطلب إلغاء (action=cancel)
+            // متزامنان على نفس الفاتورة كانا يمكن أن يقرآ كلاهما
+            // status != 'ملغاة' معاً، فيعكس كلٌّ منهما أثرها على الصندوق
+            // بشكل مستقل (خصم مضاعف من رصيد الصندوق) قبل أن يُنهي أيٌّ منهما
+            // معاملته. الإصلاح: قفل صف الفاتورة بـ FOR UPDATE داخل المعاملة
+            // وإعادة قراءة حالتها الفعلية بعد القفل مباشرة قبل اتخاذ قرار
+            // عكس الأثر.
+            $lockStmt = $pdo->prepare('SELECT * FROM invoices WHERE tenant_id = ? AND id = ? LIMIT 1 FOR UPDATE');
+            $lockStmt->execute([$tenantId, $id]);
+            $inv = $lockStmt->fetch();
+            if (!$inv) {
+                throw new Exception('الفاتورة غير موجودة');
+            }
             // لا نعكس الأثر مرتين إن كانت الفاتورة مُلغاة مسبقاً (عُكس أثرها
             // بالفعل عند الإلغاء) — نعكسه فقط إن كانت لا تزال "فعّالة"
             if (($inv['status'] ?? '') !== 'ملغاة') {
@@ -233,7 +298,7 @@ switch ($method) {
         } catch (Exception $e) {
             $pdo->rollBack();
             error_log('[Jawali][invoices] فشل حذف الفاتورة: ' . $e->getMessage());
-            json_error('خطأ داخلي في الخادم', 500);
+            json_error($e->getMessage() ?: 'خطأ داخلي في الخادم', 500);
         }
         audit("حذف فاتورة $id", $auth['email'] ?? null, 'warning', $tenantId);
         json_ok(['success' => true, 'id' => $id]);
@@ -273,8 +338,17 @@ function _reverse_invoice_effects(PDO $pdo, array $inv, ?string $byEmail, int $t
     }
 
     // استرجاع رصيد الصندوق النقدي (عكس تماماً لما حدث عند إنشاء الفاتورة)
+    //
+    // 🔧 إصلاح جوهري (فحص شامل لنظام الصناديق والبنوك — ثغرة سباق): قفل
+    // الصف بـ FOR UPDATE قبل الخصم — هذه الدالة تُستدعى من مسارَي الإلغاء
+    // والحذف، وكلاهما يتحقق من status != 'ملغاة' *قبل* بدء المعاملة بلا
+    // قفل، فطلبا إلغاء/حذف متزامنان لنفس الفاتورة كانا يمكن أن يعكسا
+    // الأثر مرتين (خصم مضاعف من الصندوق). القفل هنا يمنع ذلك فعلياً لأن
+    // ثاني طلب سينتظر حتى ينتهي الأول، ثم UPDATE invoices الخاص بالمُستدعي
+    // (الذي يضع status='ملغاة' أو يحذف السجل ضمن نفس المعاملة) يمنع أي
+    // تكرار لاحق.
     if ($cashAccountId !== '' && $paymentMethod !== 'آجل' && $total > 0) {
-        $accStmt = $pdo->prepare('SELECT * FROM cash_accounts WHERE tenant_id = ? AND id = ? LIMIT 1');
+        $accStmt = $pdo->prepare('SELECT * FROM cash_accounts WHERE tenant_id = ? AND id = ? LIMIT 1 FOR UPDATE');
         $accStmt->execute([$tenantId, $cashAccountId]);
         $acc = $accStmt->fetch();
         if ($acc) {
