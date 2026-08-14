@@ -289,7 +289,10 @@ function role_default_permissions(string $role): array {
             // تبقى حصراً لمالك التطبيق عبر لوحة المطوّر.
             return array_values(array_diff($all, ['deleteSystem', 'manageLicense']));
         case 'محاسب':
-            return ['reports', 'financialReports', 'profits', 'activityLog', 'approveSensitive'];
+            // 🔧 إصلاح (فحص شامل لنظام الصناديق والبنوك): أضيفت openDrawer
+            // ليتمكن المحاسب من الوصول الافتراضي لشاشات الصناديق/البنوك،
+            // السندات، والتحويلات المالية — مطابق لتعديل permissions.dart.
+            return ['reports', 'financialReports', 'profits', 'activityLog', 'approveSensitive', 'openDrawer'];
         case 'أمين مخزن':
             return ['manageInventory', 'editProducts', 'printBarcode', 'purchase'];
         case 'كاشير':

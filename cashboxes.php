@@ -99,6 +99,16 @@ switch ($method) {
             $to = $toStmt->fetch();
             if (!$to) json_error('الحساب الهدف غير موجود', 404);
 
+            // 🔧 إصلاح جوهري (فحص شامل لنظام الصناديق والبنوك): منع التحويل
+            // بين حسابين بعملتين مختلفتين بدون سعر صرف — طبقة حماية خادم
+            // مطابقة للحارس المُضاف مسبقاً على مستوى العميل في
+            // AppStore.transferFunds().
+            if ($from['currency'] !== $to['currency']) {
+                json_error(
+                    'لا يمكن التحويل بين حسابين بعملتين مختلفتين (' . $from['currency'] . ' → ' . $to['currency'] . ')'
+                );
+            }
+
             $pdo->beginTransaction();
             try {
                 $pdo->prepare('UPDATE cash_accounts SET balance = balance - ? WHERE id = ? AND tenant_id = ?')
