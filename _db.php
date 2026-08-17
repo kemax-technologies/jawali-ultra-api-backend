@@ -87,6 +87,16 @@ if ($originHost !== '' && str_ends_with($originHost, '.jawali-ultra.pages.dev'))
 if ($originHost !== '' && str_ends_with($originHost, '.sandbox.novita.ai')) {
     $allowedOrigins[] = $origin;
 }
+// ✅ السماح لـ http://localhost:<أي منفذ> و http://127.0.0.1:<أي منفذ> معاً
+// (وليس فقط المنافذ الثابتة 5500/8080 المُدرَجة أعلاه): أدوات التطوير/الاختبار
+// المحلية (مثل `flutter run -d chrome`، و`flutter drive -d web-server` الذي
+// يُشغّل خادماً محلياً على منفذ عشوائي في كل تشغيل، ومحرّك integration_test)
+// جميعها تُرسل Origin بمنفذ عشوائي متغيّر لا يمكن حصره في قائمة ثابتة. القيد
+// هنا لا يزال محصوراً بـ localhost/127.0.0.1 فقط (أجهزة المطوّر نفسها)، ولا
+// يفتح الباب لأي نطاق خارجي فعلي، فلا يُضعف الحماية الفعلية من CSRF.
+if ($originHost === 'localhost' || $originHost === '127.0.0.1') {
+    $allowedOrigins[] = $origin;
+}
 if (in_array($origin, $allowedOrigins, true)) {
     header("Access-Control-Allow-Origin: $origin");
     header('Vary: Origin');
