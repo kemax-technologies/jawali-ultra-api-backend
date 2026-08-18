@@ -73,7 +73,9 @@ switch ($method) {
             json_error('credit_id و amount مطلوبان');
         }
 
-        // اجلب القيد الأساسي
+        // اجلب القيد الأساسي (بلا قفل بعد — القفل الفعلي FOR UPDATE يجب أن
+        // يقع *داخل* المعاملة أدناه مباشرة قبل فحص السقف، وإلا تبقى نافذة
+        // سباق حقيقية بين طلبين متزامنين لنفس القيد).
         $stmt = $pdo->prepare('SELECT * FROM credits WHERE id = ? AND tenant_id = ? LIMIT 1');
         $stmt->execute([$creditId, $tenantId]);
         $credit = $stmt->fetch();
@@ -97,6 +99,38 @@ switch ($method) {
 
         try {
             $pdo->beginTransaction();
+
+            // 🆕 (إصلاح جوهري لسلامة البيانات — منع سداد زائد عن قيمة الدَّين):
+            // نُعيد قفل صف القيد فعلياً هنا (FOR UPDATE) ضمن المعاملة —
+            // يمنع هذا فيزيائياً حالة السباق بين طلبَي سداد متزامنَين لنفس
+            // القيد (كلاهما يقرأ نفس paid_yer القديم فيتجاوز السقف معاً رغم
+            // فحص كل منهما على حدة)، تماماً كنفس نمط الحماية المُطبَّق أصلاً
+            // على cash_accounts أدناه. بعد القفل، نتحقق أن الدفعة الجديدة لا
+            // تتجاوز المتبقي الفعلي (بسماحية 0.01 ر.ي لتقريب الفاصلة
+            // العائمة) — النظام الحالي لا يملك مفهوم "رصيد دائن/سلفة عميل"،
+            // فسداد أكبر من المتبقي يُنتج بيانات غير منطقية (paid_yer >
+            // amount_yer) تُفسِد أي تقرير مديونية لاحق.
+            $lockStmt = $pdo->prepare(
+                'SELECT * FROM credits WHERE id = ? AND tenant_id = ? LIMIT 1 FOR UPDATE'
+            );
+            $lockStmt->execute([$creditId, $tenantId]);
+            $credit = $lockStmt->fetch();
+            if (!$credit) {
+                $pdo->rollBack();
+                json_error('قيد الدَّين غير موجود', 404);
+            }
+            $remainingBeforePayment =
+                (float)$credit['amount_yer'] - (float)$credit['paid_yer'];
+            if ($amountYer > $remainingBeforePayment + 0.01) {
+                $pdo->rollBack();
+                json_error(
+                    'مبلغ الدفعة (' . number_format($amountYer, 2) . ' ر.ي) '
+                    . 'أكبر من المتبقي الفعلي على هذا القيد ('
+                    . number_format(max(0, $remainingBeforePayment), 2)
+                    . ' ر.ي) — لا يدعم النظام حالياً تسجيل سلفة/رصيد دائن '
+                    . 'للعميل، فيجب ألا تتجاوز الدفعة المتبقي المستحق'
+                );
+            }
 
             // 🆕 0) إن كانت الدفعة مرتبطة بصندوق/بنك فعلي: نفس بالضبط نمط
             // vouchers.php (قفل الصف FOR UPDATE + تحقق تطابق العملة + تحديث
