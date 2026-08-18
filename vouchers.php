@@ -156,6 +156,25 @@ switch ($method) {
                 $_SERVER['HTTP_X_USER_EMAIL'] ?? '',
             ]);
 
+            // 🤖 الترحيل المحاسبي الذرّي (فحص معماري شامل — طلب المستخدم
+            // الصريح بضمان عدم فقدان أي قيد محاسبي): يحل محل الاستدعاء
+            // المنفصل (fire-and-forget) السابق من العميل. نُرحِّل فقط
+            // السندات المرتبطة فعلياً بصندوق/بنك (أثر نقدي حقيقي مؤكَّد).
+            // سند قبض: مدين الصندوق ← دائن إيرادات أخرى. سند صرف: مدين
+            // مصروفات أخرى ← دائن الصندوق.
+            if ($cashAccountId !== '' && $amount > 0) {
+                $catSuffix = $category !== '' ? " ($category)" : '';
+                post_journal_entry_atomic(
+                    $pdo,
+                    $tenantId,
+                    $type === 'receipt' ? '1010' : '5030',
+                    $type === 'receipt' ? '4020' : '1010',
+                    $amount,
+                    ($type === 'receipt' ? 'سند قبض' : 'سند صرف') . " $partyName$catSuffix",
+                    $id
+                );
+            }
+
             $pdo->commit();
         } catch (Exception $e) {
             $pdo->rollBack();
@@ -215,6 +234,13 @@ switch ($method) {
                     $_SERVER['HTTP_X_USER_EMAIL'] ?? null,
                 ]);
             }
+
+            // 🤖 عكس الأثر المحاسبي بأمان تام (إصلاح معماري جوهري — إبطال
+            // وليس حذف، حفاظاً على الأثر التدقيقي): يعمل بأمان حتى لو لم
+            // يوجد قيد أصلاً (سند بلا صندوق مرتبط لم يُرحَّل قط).
+            $pdo->prepare(
+                "UPDATE journal_entries SET status = 'void' WHERE tenant_id = ? AND reference = ? AND status = 'posted'"
+            )->execute([$tenantId, $id]);
 
             $pdo->prepare('DELETE FROM vouchers WHERE id = ? AND tenant_id = ?')->execute([$id, $tenantId]);
             $pdo->commit();

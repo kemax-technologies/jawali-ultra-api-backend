@@ -127,6 +127,24 @@ switch ($method) {
                 }
             }
 
+            // 🤖 الترحيل المحاسبي الذرّي (فحص معماري شامل — طلب المستخدم
+            // الصريح بضمان عدم فقدان أي قيد محاسبي): يحل محل الاستدعاء
+            // المنفصل (fire-and-forget) السابق من العميل — دائماً "مدين:
+            // تكلفة/مشتريات البضاعة" مقابل "دائن: الصندوق" (نقدية) أو
+            // "دائن: الذمم الدائنة/الموردون" (آجلة)، ضمن نفس معاملة الحفظ.
+            if ($total > 0) {
+                $isCreditPurchase = ($paymentMethod === 'آجل');
+                post_journal_entry_atomic(
+                    $pdo,
+                    $tenantId,
+                    '5010',
+                    $isCreditPurchase ? '2010' : '1010',
+                    $total,
+                    "فاتورة مشتريات $id من " . ($b['supplier'] ?? $b['supplier_name'] ?? 'مورد'),
+                    $id
+                );
+            }
+
             $pdo->commit();
         } catch (Exception $e) {
             $pdo->rollBack();

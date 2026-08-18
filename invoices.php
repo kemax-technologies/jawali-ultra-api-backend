@@ -242,6 +242,26 @@ switch ($method) {
                 }
             }
 
+            // 🤖 الترحيل المحاسبي الذرّي (فحص معماري شامل — طلب المستخدم الصريح
+            // بضمان عدم فقدان أي قيد محاسبي): يحل محل الاستدعاء المنفصل
+            // (fire-and-forget) السابق من العميل لـ _autoPostJournalEntry —
+            // بنفس منطق العمل تماماً (مدين: الذمم المدينة إن كانت آجلة، أو
+            // الصندوق إن كانت نقدية ← دائن: إيرادات المبيعات) لكن الآن ضمن
+            // نفس معاملة PDO التي تُسجِّل الفاتورة نفسها، فيستحيل فيزيائياً
+            // فقدان القيد بصرف النظر عمّا يحدث لاتصال العميل لاحقاً.
+            if ($total > 0) {
+                $isCreditSale = ($paymentMethod === 'آجل');
+                post_journal_entry_atomic(
+                    $pdo,
+                    $tenantId,
+                    $isCreditSale ? '1020' : '1010',
+                    '4010',
+                    $total,
+                    "إيراد فاتورة بيع $id",
+                    $id
+                );
+            }
+
             $pdo->commit();
         } catch (Exception $e) {
             $pdo->rollBack();
@@ -364,4 +384,11 @@ function _reverse_invoice_effects(PDO $pdo, array $inv, ?string $byEmail, int $t
             ]);
         }
     }
+
+    // 🤖 عكس الأثر المحاسبي بأمان تام: إبطال (وليس حذف — حفاظاً على الأثر
+    // التدقيقي) القيد المحاسبي الذي رُحِّل تلقائياً عند إنشاء هذه الفاتورة،
+    // ضمن نفس معاملة الإلغاء/الحذف التي استدعت هذه الدالة.
+    $pdo->prepare(
+        "UPDATE journal_entries SET status = 'void' WHERE tenant_id = ? AND reference = ? AND status = 'posted'"
+    )->execute([$tenantId, $id]);
 }

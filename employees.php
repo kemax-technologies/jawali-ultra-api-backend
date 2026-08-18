@@ -148,6 +148,22 @@ switch ($method) {
                     $netAmount, $emp['currency'], $cashAccountId, $notes, $tenantId,
                 ]);
 
+                // 🤖 الترحيل المحاسبي الذرّي (فحص معماري شامل — طلب المستخدم
+                // الصريح بضمان عدم فقدان أي قيد محاسبي): يحل محل الاستدعاء
+                // المنفصل (fire-and-forget) السابق من العميل — "مدين: مصروف
+                // الرواتب ← دائن: الصندوق" (لا يوجد مفهوم راتب آجل هنا).
+                if ($netAmount > 0) {
+                    post_journal_entry_atomic(
+                        $pdo,
+                        $tenantId,
+                        '5020',
+                        '1010',
+                        $netAmount,
+                        "صرف راتب {$emp['name']} عن $period",
+                        $id
+                    );
+                }
+
                 $pdo->commit();
             } catch (Exception $e) {
                 $pdo->rollBack();
@@ -237,6 +253,12 @@ switch ($method) {
                         $_SERVER['HTTP_X_USER_EMAIL'] ?? null, $tenantId,
                     ]);
                 }
+                // 🤖 عكس الأثر المحاسبي بأمان تام (إصلاح معماري جوهري — إبطال
+                // وليس حذف، حفاظاً على الأثر التدقيقي).
+                $pdo->prepare(
+                    "UPDATE journal_entries SET status = 'void' WHERE tenant_id = ? AND reference = ? AND status = 'posted'"
+                )->execute([$tenantId, $id]);
+
                 $pdo->prepare('DELETE FROM payroll_runs WHERE id = ? AND tenant_id = ?')->execute([$id, $tenantId]);
                 $pdo->commit();
             } catch (Exception $e) {
