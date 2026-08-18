@@ -99,13 +99,44 @@ switch ($method) {
                 )->execute(['WS-' . round(microtime(true) * 1000), $toId, $sku, $qty, $tenantId]);
 
                 $txId = 'WT-' . round(microtime(true) * 1000);
+                $byEmail = $_SERVER['HTTP_X_USER_EMAIL'] ?? null;
                 $pdo->prepare(
                     'INSERT INTO warehouse_transfers
                        (id, from_warehouse_id, to_warehouse_id, product_sku, qty, notes, created_by, tenant_id)
                      VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
                 )->execute([
                     $txId, $fromId, $toId, $sku, $qty, $notes,
-                    $_SERVER['HTTP_X_USER_EMAIL'] ?? null, $tenantId,
+                    $byEmail, $tenantId,
+                ]);
+
+                // 📒 تسجيل حركتين في سجل حركات المخزون الموحَّد (صادر من
+                // المصدر ووارد للوجهة) — يحقق "سجل ومراجعة حركات المخازن"
+                // بنفس بنية التوريد/الصرف/الجرد (راجع inventory_movements.php).
+                $toStockAfter = $pdo->prepare(
+                    'SELECT stock FROM warehouse_stock WHERE warehouse_id = ? AND product_sku = ? AND tenant_id = ?'
+                );
+                $toStockAfter->execute([$toId, $sku, $tenantId]);
+                $toAfter = (int)($toStockAfter->fetch()['stock'] ?? $qty);
+
+                $pdo->prepare(
+                    'INSERT INTO inventory_movements
+                        (id, tenant_id, warehouse_id, product_sku, movement_type, direction, qty,
+                         balance_before, balance_after, reason, document_number, reference_id, created_by)
+                     VALUES (?,?,?,?,\'transfer_out\',\'out\',?,?,?,?,?,?,?)'
+                )->execute([
+                    'IM-' . round(microtime(true) * 1000) . '-1', $tenantId, $fromId, $sku,
+                    $qty, $availableQty, $availableQty - $qty,
+                    $notes !== '' ? $notes : 'تحويل مخزون بين المخازن', $txId, $txId, $byEmail,
+                ]);
+                $pdo->prepare(
+                    'INSERT INTO inventory_movements
+                        (id, tenant_id, warehouse_id, product_sku, movement_type, direction, qty,
+                         balance_before, balance_after, reason, document_number, reference_id, created_by)
+                     VALUES (?,?,?,?,\'transfer_in\',\'in\',?,?,?,?,?,?,?)'
+                )->execute([
+                    'IM-' . round(microtime(true) * 1000) . '-2', $tenantId, $toId, $sku,
+                    $qty, $toAfter - $qty, $toAfter,
+                    $notes !== '' ? $notes : 'تحويل مخزون بين المخازن', $txId, $txId, $byEmail,
                 ]);
 
                 $pdo->commit();
