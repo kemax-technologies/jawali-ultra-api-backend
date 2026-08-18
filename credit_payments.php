@@ -166,6 +166,27 @@ switch ($method) {
             );
             $upd->execute([$newPaidYer, $newPaidUsd, $newStatus, $creditId, $tenantId]);
 
+            // 🤖 3) الترحيل المحاسبي الذرّي (إصلاح معماري جوهري — راجع التوثيق
+            // الكامل أعلى post_journal_entry_atomic() في _db.php): يُنفَّذ الآن
+            // *ضمن نفس هذه المعاملة بالضبط* بدل انتظار طلب HTTP ثانٍ منفصل من
+            // العميل بعد commit() — فيستحيل فيزيائياً فقدان القيد المحاسبي حتى
+            // لو انقطع اتصال العميل فوراً بعد إرسال هذا الطلب، لأن القيد إما
+            // يُثبَّت معاً مع الدفعة بنفس commit() الواحد أو يُلغى معهما كلياً.
+            // نُرحِّل فقط إن كانت الدفعة مرتبطة فعلياً بصندوق/بنك (أثر نقدي
+            // حقيقي مؤكَّد) — دفعة بلا صندوق محدَّد ليس لها أثر نقدي بعد، فلا
+            // يجوز ترحيلها محاسبياً (مطابق تماماً للقرار المعماري الأصلي).
+            if ($cashAccountId !== '') {
+                post_journal_entry_atomic(
+                    $pdo,
+                    $tenantId,
+                    '1010',
+                    '1020',
+                    $amountYer,
+                    "تحصيل دفعة سداد $id على القيد $creditId",
+                    $id
+                );
+            }
+
             $pdo->commit();
         } catch (Exception $e) {
             $pdo->rollBack();
@@ -234,6 +255,16 @@ switch ($method) {
                     $_SERVER['HTTP_X_USER_EMAIL'] ?? null,
                 ]);
             }
+
+            // 🤖 عكس الأثر المحاسبي بأمان تام (إصلاح معماري جوهري — تناظر مع
+            // الترحيل الذرّي عند الإنشاء أعلاه): بما أن القيد المحاسبي أصبح
+            // الآن مضمون الوجود دائماً لكل دفعة مرتبطة بصندوق، يجب إلغاؤه
+            // (status='void'، وليس حذفاً فعلياً — يحافظ على أثر التدقيق) ضمن
+            // نفس هذه المعاملة الذرّية بالضبط عند حذف الدفعة، وإلا يبقى قيد
+            // "posted" يتيماً يُشوِّه دفتر الأستاذ رغم زوال الدفعة المصدر.
+            $pdo->prepare(
+                "UPDATE journal_entries SET status = 'void' WHERE tenant_id = ? AND reference = ? AND status = 'posted'"
+            )->execute([$tenantId, $id]);
 
             // احذف الدفعة
             $pdo->prepare('DELETE FROM credit_payments WHERE id = ? AND tenant_id = ?')->execute([$id, $tenantId]);

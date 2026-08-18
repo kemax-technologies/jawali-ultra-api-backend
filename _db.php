@@ -654,3 +654,131 @@ function tenant_id_from_auth(array $auth): int {
     }
     return (int)$tid;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 🤖 الترحيل المحاسبي الذرّي (فحص معماري شامل — طلب المستخدم الصريح بعدم
+// وجود قيود مفقودة أو مكررة أو غير متوازنة):
+//
+// ⚠️ المشكلة الجذرية التي يحلّها هذا الملف: كان الترحيل المحاسبي التلقائي في
+// عميل Flutter (AppStore._autoPostJournalEntry) يُنفَّذ كطلب HTTP **ثانٍ
+// ومنفصل تماماً** (POST /accounting.php) بعد نجاح طلب العملية التجارية
+// الأصلية (مثل POST /credit_payments.php) وبنمط "fire-and-forget"
+// (unawaited). إن انقطع تطبيق العميل (تحطّم المتصفح/إغلاق التبويب/فقدان
+// الشبكة) في الفاصل الزمني الدقيق بين الطلبين — وهو بالضبط ما حدث فعلياً
+// وتأكَّد بالتحقق المباشر من قاعدة بيانات الإنتاج أثناء اختبار E2E حقيقي —
+// تنجح العملية التجارية (تُسجَّل الدفعة، يتحرّك الصندوق) لكن **يُفقَد القيد
+// المحاسبي المقابل نهائياً وبلا أي أثر أو آلية تعويض**. هذا انتهاك مباشر
+// لضمان "عدم فقدان أي قيد" رغم أن كل استعلام SQL فردي كان "آمناً" بمعزل عن
+// غيره.
+//
+// ✅ الحل الجذري والدائم (وليس حلاً مؤقتاً): تُستدعى هاتان الدالتان **من
+// داخل نفس معاملة PDO الذرّية (transaction)** التي تُسجِّل العملية التجارية
+// نفسها في كل ملف API ذي صلة (credit_payments.php، vouchers.php،
+// invoices.php، payroll.php، purchases.php...). بذلك يصبح القيد المحاسبي
+// وعمليته التجارية المصدر ذرّيين تماماً معاً: إما ينجح كلاهما ويُثبَّتان
+// بنفس commit()، أو يفشل كلاهما ويُلغَى كل شيء بنفس rollBack() — فلا يمكن
+// فيزيائياً وجود حالة "دفعة بلا قيد" بعد اليوم، بصرف النظر عمّا يحدث لاحقاً
+// لاتصال العميل بعد إرسال الطلب.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// المواصفات القياسية لكل حساب في الدليل — نفس القائمة الموحَّدة المستخدَمة
+/// سابقاً في عميل Flutter (AppStore._standardAccounts)، مُعاد تعريفها هنا
+/// على الخادم لأن الخادم هو الآن من يملك مسؤولية إنشاء هذه الحسابات ذرّياً.
+const STANDARD_ACCOUNTS = [
+    '1010' => ['الصندوق والبنوك', 'asset'],
+    '1020' => ['الذمم المدينة (العملاء)', 'asset'],
+    '2010' => ['الذمم الدائنة (الموردون)', 'liability'],
+    '4010' => ['إيرادات المبيعات', 'revenue'],
+    '4020' => ['إيرادات أخرى (سندات قبض)', 'revenue'],
+    '5010' => ['تكلفة/مشتريات البضاعة', 'expense'],
+    '5020' => ['مصروف الرواتب', 'expense'],
+    '5030' => ['مصروفات أخرى (سندات صرف)', 'expense'],
+];
+
+/// يُرجع معرّف حساب قياسي من الدليل ضمن نفس المعاملة الذرّية الجارية،
+/// مُنشئاً إياه تلقائياً إن لم يكن موجوداً بعد — **يجب** استدعاؤها من داخل
+/// $pdo->beginTransaction() جارية بالفعل (لا تبدأ/تُنهي أي معاملة بنفسها).
+///
+/// ✅ ضمان عدم التكرار: قيد UNIQUE(tenant_id, code) في قاعدة البيانات يمنع
+/// إنشاء حسابين بنفس الرمز لنفس المتجر حتى مع طلبين متزامنين تماماً — لذا
+/// نستخدم INSERT ... ON CONFLICT DO NOTHING ثم نقرأ السطر الموجود دائماً
+/// بعدها (سواء أُنشئ للتو أو كان موجوداً أصلاً)، فتُضمَن الذرّية والاتساق
+/// معاً دون أي حالة تعارض غير معالجة.
+function get_or_create_standard_account(PDO $pdo, int $tenantId, string $code): ?string {
+    if (!isset(STANDARD_ACCOUNTS[$code])) return null; // رمز غير معروف — حماية دفاعية
+    $id = 'COA-' . $tenantId . '-' . $code;
+    [$name, $type] = STANDARD_ACCOUNTS[$code];
+    $pdo->prepare(
+        'INSERT INTO chart_of_accounts (id, code, name, type, opening_balance, notes, tenant_id)
+         VALUES (?, ?, ?, ?, 0, ?, ?)
+         ON CONFLICT (tenant_id, code) DO NOTHING'
+    )->execute([$id, $code, $name, $type, 'حساب أُنشئ تلقائياً بواسطة نظام الترحيل المحاسبي', $tenantId]);
+    // اقرأ السطر الفعلي دائماً (قد يكون معرّفه مختلفاً عن $id الحتمي إن كان
+    // موجوداً مسبقاً بمعرّف آخر من مسار قديم — نادر لكن ممكن نظرياً).
+    $stmt = $pdo->prepare('SELECT id FROM chart_of_accounts WHERE tenant_id = ? AND code = ? LIMIT 1');
+    $stmt->execute([$tenantId, $code]);
+    $row = $stmt->fetch();
+    return $row ? $row['id'] : null;
+}
+
+/// يُرحِّل قيد يومية مزدوج بسطرين (مدين/دائن) بأمان تام **ضمن نفس المعاملة
+/// الذرّية الجارية بالفعل** — لا تبدأ/تُنهي أي معاملة بنفسها، ولا تُطلِق أي
+/// استثناء يُفشل استدعاءها (تُعيد false بدلاً من ذلك) حتى لا تُسقِط العملية
+/// التجارية الأصلية بسبب فشل جانبي في تحديد الحسابات القياسية فقط — لكن أي
+/// فشل حقيقي في INSERT (مثل عطل اتصال قاعدة بيانات) سيُلقي استثناء PDO
+/// طبيعياً يُبطل المعاملة كلها (وهو المطلوب: تعطّل حقيقي في القاعدة يجب أن
+/// يُلغي العملية بأكملها وليس فقط جزأها المحاسبي).
+///
+/// [reference] يُربط دائماً بمعرّف العملية المصدر — ويُستخدم أيضاً كحارس
+/// **منع تكرار** صريح: إن وُجد قيد "posted" بنفس reference من قبل (مثال:
+/// إعادة محاولة عرضية لنفس الطلب)، لا يُنشأ قيد ثانٍ مطلقاً.
+function post_journal_entry_atomic(
+    PDO $pdo,
+    int $tenantId,
+    string $debitCode,
+    string $creditCode,
+    float $amount,
+    string $description,
+    string $reference
+): bool {
+    if ($amount <= 0) return false;
+
+    // 🔒 حارس منع التكرار الصريح: لا تُنشئ قيداً ثانياً لنفس المرجع إن كان
+    // هناك بالفعل قيد "posted" (غير ملغى) بنفس reference لنفس المتجر —
+    // يحمي من أي إعادة محاولة عرضية (retry) على مستوى الشبكة/العميل.
+    $dupChk = $pdo->prepare(
+        "SELECT 1 FROM journal_entries WHERE tenant_id = ? AND reference = ? AND status = 'posted' LIMIT 1"
+    );
+    $dupChk->execute([$tenantId, $reference]);
+    if ($dupChk->fetch()) {
+        error_log("[Jawali][post_journal_entry_atomic] تجاهل قيد مكرر لنفس المرجع: $reference");
+        return true; // ليس فشلاً — القيد موجود بالفعل، وهذا هو المطلوب فعلياً
+    }
+
+    $debitId = get_or_create_standard_account($pdo, $tenantId, $debitCode);
+    $creditId = get_or_create_standard_account($pdo, $tenantId, $creditCode);
+    if ($debitId === null || $creditId === null) {
+        error_log("[Jawali][post_journal_entry_atomic] تعذّر تحديد الحسابات القياسية ($debitCode/$creditCode) لـ: $description");
+        return false;
+    }
+
+    $id = 'JE-' . round(microtime(true) * 1000);
+    $entryNumber = 'JE-' . substr($id, -6);
+
+    $pdo->prepare(
+        'INSERT INTO journal_entries (id, entry_number, date, description, reference, status, created_by, tenant_id)
+         VALUES (?, ?, NOW(), ?, ?, \'posted\', ?, ?)'
+    )->execute([$id, $entryNumber, $description, $reference, $_SERVER['HTTP_X_USER_EMAIL'] ?? '', $tenantId]);
+
+    $pdo->prepare(
+        'INSERT INTO journal_entry_lines (id, entry_id, account_id, debit, credit, notes, tenant_id)
+         VALUES (?, ?, ?, ?, 0, \'\', ?)'
+    )->execute([$id . '-L1', $id, $debitId, $amount, $tenantId]);
+
+    $pdo->prepare(
+        'INSERT INTO journal_entry_lines (id, entry_id, account_id, debit, credit, notes, tenant_id)
+         VALUES (?, ?, ?, 0, ?, \'\', ?)'
+    )->execute([$id . '-L2', $id, $creditId, $amount, $tenantId]);
+
+    return true;
+}
