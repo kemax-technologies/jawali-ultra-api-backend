@@ -75,23 +75,48 @@ switch ($method) {
         if ($sku === '' || $name === '') json_error('SKU والاسم مطلوبان');
 
         // 📦 الوحدات المتعددة (كرتون، قطعة)
-        $baseUnit      = trim($body['base_unit']      ?? 'قطعة');
-        $packUnit      = trim($body['pack_unit']      ?? 'كرتون');
-        $packFactor    = (int)($body['pack_factor']   ?? 1);
-        $packPrice     = (float)($body['pack_price']  ?? 0);
-        $packBarcode   = $body['pack_barcode']         ?? null;
-        $allowPackSale = (int)(($body['allow_pack_sale'] ?? 1) ? 1 : 0);
+        // 🛠️ إصلاح خلل حقيقي مكتشَف أثناء الفحص: عميل Flutter (StoreProduct.
+        // toMap()) يرسل هذه الحقول بصيغة camelCase (baseUnit/packUnit/...)
+        // بينما كان هذا المعالج يقرأ فقط الصيغة snake_case (base_unit/
+        // pack_unit/...) — ما كان يعني أن كل قيم الوحدات المتعددة المُرسَلة
+        // فعلياً من التطبيق كانت تُفقَد دائماً وتُستبدَل بالقيم الافتراضية
+        // (تأكَّد هذا فعلياً: كل صف في قاعدة الإنتاج كان base_unit='قطعة' و
+        // pack_unit='كرتون' بلا استثناء رغم إدخال المستخدم قيماً أخرى في
+        // الواجهة). التصحيح: قبول الصيغتين معاً (نفس نمط warehouses.php).
+        $baseUnit      = trim(($body['base_unit'] ?? $body['baseUnit']) ?? 'قطعة');
+        $packUnit      = trim(($body['pack_unit'] ?? $body['packUnit']) ?? 'كرتون');
+        $packFactor    = (int)(($body['pack_factor'] ?? $body['packFactor']) ?? 1);
+        $packPrice     = (float)(($body['pack_price'] ?? $body['packPrice']) ?? 0);
+        $packBarcode   = ($body['pack_barcode'] ?? $body['packBarcode']) ?? null;
+        $allowPackSaleRaw = $body['allow_pack_sale'] ?? $body['allowPackSale'] ?? true;
+        $allowPackSale = (int)(filter_var($allowPackSaleRaw, FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE) ?? true);
 
         // ✅ تحقق من القيم
         if ($packFactor < 1) $packFactor = 1;
         if ($baseUnit === '') $baseUnit = 'قطعة';
 
+        // 🆕 حقول ملف الأصناف الموسّعة (Migration 012): العلامة التجارية،
+        // تاريخ الانتهاء، وحالة تفعيل الصنف. جميعها اختيارية.
+        $brand = $body['brand'] ?? null;
+        if (is_string($brand)) { $brand = trim($brand); if ($brand === '') $brand = null; }
+        $expiryDateRaw = $body['expiryDate'] ?? $body['expiry_date'] ?? null;
+        $expiryDate = null;
+        if (is_string($expiryDateRaw) && trim($expiryDateRaw) !== '') {
+            // نقبل ISO8601 كامل (2025-01-01T00:00:00.000) أو تاريخاً مجرداً
+            $ts = strtotime($expiryDateRaw);
+            if ($ts !== false) $expiryDate = date('Y-m-d', $ts);
+        }
+        $isActiveRaw = $body['is_active'] ?? $body['isActive'] ?? true;
+        $isActive = filter_var($isActiveRaw, FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE);
+        if ($isActive === null) $isActive = true;
+
         // ✅ تحويل PostgreSQL: ON DUPLICATE KEY UPDATE → ON CONFLICT DO UPDATE SET
         $stmt = $pdo->prepare(
             'INSERT INTO products
                 (tenant_id, sku, name, category, price, cost, stock, sold, barcode, image_url,
-                 base_unit, pack_unit, pack_factor, pack_price, pack_barcode, allow_pack_sale)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 base_unit, pack_unit, pack_factor, pack_price, pack_barcode, allow_pack_sale,
+                 brand, expiry_date, is_active)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
              ON CONFLICT (tenant_id, sku) DO UPDATE SET
                 name            = EXCLUDED.name,
                 category        = EXCLUDED.category,
@@ -106,7 +131,10 @@ switch ($method) {
                 pack_factor     = EXCLUDED.pack_factor,
                 pack_price      = EXCLUDED.pack_price,
                 pack_barcode    = EXCLUDED.pack_barcode,
-                allow_pack_sale = EXCLUDED.allow_pack_sale'
+                allow_pack_sale = EXCLUDED.allow_pack_sale,
+                brand           = EXCLUDED.brand,
+                expiry_date     = EXCLUDED.expiry_date,
+                is_active       = EXCLUDED.is_active'
         );
         $stmt->execute([
             $tenantId, $sku, $name,
@@ -115,14 +143,17 @@ switch ($method) {
             (float)($body['cost']   ?? 0),
             (int)  ($body['stock']  ?? 0),
             (int)  ($body['sold']   ?? 0),
-            $body['barcode']   ?? null,
-            $body['image_url'] ?? null,
+            $body['barcode'] ?? null,
+            ($body['imageUrl'] ?? $body['image_url']) ?? null,
             $baseUnit,
             $packUnit,
             $packFactor,
             $packPrice,
             $packBarcode,
             $allowPackSale,
+            $brand,
+            $expiryDate,
+            $isActive,
         ]);
         audit("upsert product $sku (units: $baseUnit / $packUnit x$packFactor)", null, 'info', $tenantId);
         json_ok(['success' => true, 'sku' => $sku]);
