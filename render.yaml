@@ -1,0 +1,33 @@
+services:
+  - type: web
+    name: jawali-ultra-api
+    runtime: docker
+    plan: free
+    region: singapore
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    envVars:
+      - key: DB_HOST
+        sync: false
+      - key: DB_PORT
+        sync: false
+      - key: DB_NAME
+        sync: false
+      - key: DB_USER
+        sync: false
+      - key: DB_PASS
+        sync: false
+      - key: DB_SSLMODE
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: DEV_JWT_SECRET
+        sync: false
+      - key: DEV_PANEL_PASSWORD_HASH
+        sync: false
+      - key: JAWALI_DEV_MODE
+        value: "0"
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
