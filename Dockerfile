@@ -1,4 +1,4 @@
-FROM php:8.2-cli
+FROM php:8.2-apache
 
 # ── تثبيت الإضافات المطلوبة (PDO + PostgreSQL + JSON + mbstring) ────────────
 RUN apt-get update && apt-get install -y \
@@ -6,14 +6,25 @@ RUN apt-get update && apt-get install -y \
         unzip \
     && docker-php-ext-install pdo pdo_pgsql \
     && docker-php-ext-enable pdo_pgsql \
+    && a2enmod rewrite headers \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
-COPY . /app
+# تمرير ترويسة Authorization إلى PHP (ضروري لـ JWT) + تفعيل .htaccess (AllowOverride)
+RUN { \
+        echo '<Directory /var/www/html>'; \
+        echo '    AllowOverride All'; \
+        echo '    Require all granted'; \
+        echo '</Directory>'; \
+    } > /etc/apache2/conf-available/jawali-overrides.conf \
+    && a2enconf jawali-overrides
 
-# Render يمرّر منفذ التشغيل عبر متغير البيئة PORT (افتراضي 10000 محلياً كخيار احتياطي)
+# تمرير ترويسة Authorization لبيئة PHP (mod_php لا يمررها تلقائياً كـ CGI)
+RUN echo 'SetEnvIf Authorization "(.*)" HTTP_AUTHORIZATION=$1' >> /etc/apache2/conf-available/jawali-overrides.conf
+
+WORKDIR /var/www/html
+COPY . /var/www/html
+
 ENV PORT=10000
 EXPOSE 10000
 
-# خادم PHP المدمج يكفي لهذا الحجم من الحمل (بديل عن Apache/Nginx)
-CMD ["sh", "-c", "php -S 0.0.0.0:${PORT} -t /app"]
+CMD ["sh", "-c", "sed -i \"s/Listen .*/Listen ${PORT}/\" /etc/apache2/ports.conf && sed -i \"s/<VirtualHost \\*:.*>/<VirtualHost *:${PORT}>/\" /etc/apache2/sites-available/000-default.conf && apache2-foreground"]
