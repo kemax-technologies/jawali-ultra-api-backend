@@ -152,21 +152,50 @@ switch ($method) {
         }
 
         // ── إنشاء/تحديث مخزن ─────────────────────────────────────────────────
+        // 🔧 إصلاح جذري خطير #1 (فحص مباشر بقاعدة البيانات — 2026-08-23):
+        // نفس علة cashboxes.php — تحديد "جديد؟" بفحص وجود الصف فعلياً في
+        // قاعدة البيانات (idempotent) بدل الاعتماد فقط على خلو المعرّف، حتى
+        // يعمل الإنشاء بأمان سواء أرسل العميل معرّفاً فارغاً أو معرّفاً جاهزاً
+        // من جهته (وهذا الأخير ضروري الآن بعد جعل addOrUpdateWarehouse في
+        // Flutter يولِّد المعرّف على العميل، تماماً كما addCashAccount).
         $id   = trim($body['id'] ?? '');
         $name = trim($body['name'] ?? '');
         if ($name === '') json_error('اسم المخزن مطلوب');
-        $isNew = $id === '';
-        if ($isNew) $id = 'WH-' . round(microtime(true) * 1000);
+        if ($id === '') {
+            $isNew = true;
+            $id = 'WH-' . round(microtime(true) * 1000);
+        } else {
+            $existsStmt = $pdo->prepare('SELECT 1 FROM warehouses WHERE id = ? AND tenant_id = ? LIMIT 1');
+            $existsStmt->execute([$id, $tenantId]);
+            $isNew = $existsStmt->fetchColumn() === false;
+        }
 
+        // 🔧 إصلاح جذري خطير #2 (فحص مباشر — الأهم والأخطر): "(bool)" في PHP
+        // يُحوِّل false إلى قيمة سليمة منطقياً، لكن عند تمريرها لـ PDO::execute
+        // ضمن مصفوفة، PDO يُربطها بصفة PDO::PARAM_STR الافتراضية فتتحوّل إلى
+        // نص فارغ ''، وPostgreSQL يرفض '' كقيمة لعمود BOOLEAN برسالة:
+        // "invalid input syntax for type boolean" — وهذا يُسبب استثناءً غير
+        // مُعالَج (uncaught PDOException) يُطبَع كصفحة HTML لخطأ فاتال **بينما
+        // رمز حالة HTTP يبقى 200** (لأن header() أُرسل مسبقاً قبل الاستثناء)!
+        // النتيجة: يفشل تحليل JSON في تطبيق Flutter (jsonDecode يستثني) ولا
+        // يُصنَّف كخطأ خادم متوقَّع — فيظهر للمستخدم "تعذّر الحفظ" حتى لو كان
+        // الإدراج نفسه لم يحدث إطلاقاً هذه المرة (باستثناء الحالات التي كانت
+        // "افتراضي" مفعّلة=true، حيث start_default=true ينجح دون مشكلة، وهذا
+        // يطابق تماماً ما وجدناه في قاعدة البيانات الحقيقية: 100% من المخازن
+        // المخزَّنة فعلاً لديها is_default=true، صفر لديها false!).
+        // الإصلاح: نحوّل القيمة المنطقية صراحة إلى نص PostgreSQL السليم
+        // ('true'/'false') قبل تمريرها لـ execute، بدل الاعتماد على تحويل
+        // PHP/PDO الضمني غير الموثوق لقيم bool.
         $location  = $body['location'] ?? '';
         $isDefault = (bool)($body['is_default'] ?? $body['isDefault'] ?? false);
+        $isDefaultSql = $isDefault ? 'true' : 'false';
         $notes     = $body['notes'] ?? '';
 
         if ($isNew) {
             $stmt = $pdo->prepare(
                 'INSERT INTO warehouses (id, name, location, is_default, notes, tenant_id) VALUES (?, ?, ?, ?, ?, ?)'
             );
-            $stmt->execute([$id, $name, $location, $isDefault, $notes, $tenantId]);
+            $stmt->execute([$id, $name, $location, $isDefaultSql, $notes, $tenantId]);
             audit("create warehouse $id ($name)", null, 'info', $tenantId);
         } else {
             $stmt = $pdo->prepare(
