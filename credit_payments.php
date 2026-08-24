@@ -97,6 +97,27 @@ switch ($method) {
             ?? $body['customerPhone']
             ?? $credit['customer_phone'];
 
+        // 🔧 إصلاح جوهري خطير (نفس الثغرة المُصلَحة في invoices.php/purchases.php/
+        // returns.php/purchase_returns.php): العميل (Flutter recordCreditPayment)
+        // يُرسل معرِّفاً نهائياً ثابتاً (id: 'PM-...') عبر dispatch() لا dispatchCreate()
+        // — أي أن كل إعادة محاولة من طابور الأوفلاين تُرسل بالضبط نفس id. لكن قبل
+        // هذا الإصلاح، لم يوجد أي فحص وجود مسبق قبل تنفيذ الآثار الجانبية (تحديث
+        // رصيد الصندوق + إدراج حركة صندوق + تحديث paid_yer/paid_usd على القيد +
+        // ترحيل قيد محاسبي) — فإعادة محاولة لطلب ناجح فعلاً كانت تُكرِّر كل هذه
+        // الآثار الجانبية بالكامل (تحصيل مضاعف حقيقي في رصيد الصندوق وميزان الذمم)
+        // رغم أن الإدراج النهائي في credit_payments كان سيتعارض مفتاحاً أساسياً.
+        $existsStmt = $pdo->prepare('SELECT 1 FROM credit_payments WHERE id = ? AND tenant_id = ? LIMIT 1');
+        $existsStmt->execute([$id, $tenantId]);
+        if ($existsStmt->fetchColumn() !== false) {
+            audit("دفعة سداد $id (إعادة محاولة متجاهَلة — موجودة بالفعل)", null, 'info', $tenantId);
+            json_ok([
+                'success'     => true,
+                'id'          => $id,
+                'idempotent'  => true,
+            ]);
+            break;
+        }
+
         try {
             $pdo->beginTransaction();
 

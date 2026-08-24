@@ -44,6 +44,22 @@ switch ($method) {
         $items        = $b['items'] ?? [];
         $date         = $b['date'] ?? date('Y-m-d H:i:s');
 
+        // 🔧 إصلاح جوهري خطير (نفس فئة ثغرة idempotency-on-retry المُصلَحة
+        // في returns.php/invoices.php/purchases.php): نمط ON CONFLICT DO
+        // UPDATE أدناه يجعل إدراج سجل المرتجع نفسه idempotent، لكن خصم
+        // المخزون وتخفيض رصيد المورد بعده كانا يُعادان تنفيذهما حرفياً في
+        // كل استدعاء بلا أي حارس — إعادة محاولة من طابور الأوفلاين لمرتجع
+        // شراء نجح فعلاً على الخادم كانت تُخصِم الكمية من المخزون وتُخفِّض
+        // رصيد المورد *مرتين* لعملية إرجاع واحدة فقط. الإصلاح: التحقق من
+        // وجود المرتجع فعلياً قبل أي تأثير على المخزون/رصيد المورد.
+        $existsStmt = $pdo->prepare('SELECT 1 FROM purchase_returns WHERE id = ? AND tenant_id = ? LIMIT 1');
+        $existsStmt->execute([$id, $tenantId]);
+        if ($existsStmt->fetchColumn() !== false) {
+            audit("مرتجع شراء $id (إعادة محاولة متجاهَلة — موجود بالفعل)", null, 'info', $tenantId);
+            json_ok(['success' => true, 'id' => $id, 'idempotent' => true]);
+            break;
+        }
+
         $stmt = $pdo->prepare(
             'INSERT INTO purchase_returns (id, tenant_id, purchase_id, supplier_name, reason, amount, items_json, date)
              VALUES (?,?,?,?,?,?,?,?)
