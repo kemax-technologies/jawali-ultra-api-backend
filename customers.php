@@ -83,6 +83,12 @@ switch ($method) {
         $phone = $_GET['phone'] ?? '';
         if ($phone === '') json_error('phone مطلوب');
         $pdo->prepare('DELETE FROM customers WHERE tenant_id = ? AND phone = ?')->execute([$tenantId, $phone]);
+        // 🔧 إصلاح نقص في سجل التدقيق: معالج DELETE هنا لم يكن يستدعي audit()
+        // إطلاقاً (بخلاف معالج POST أعلاه، وبخلاف النمط المطابق في
+        // products.php الذي يُسجِّل كل من الإضافة والحذف) — أي أن حذف عميل
+        // (عملية حساسة قد تُفقد سجل ذمم/تاريخ شراء) لم يكن يترك أي أثر في
+        // سجل التدقيق.
+        audit("delete customer $phone", null, 'info', $tenantId);
         json_ok(['success' => true]);
         break;
     }

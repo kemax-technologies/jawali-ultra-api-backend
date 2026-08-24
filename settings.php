@@ -29,9 +29,25 @@ switch ($method) {
             'INSERT INTO settings (tenant_id, setting_key, setting_value) VALUES (?, ?, ?)
              ON CONFLICT (tenant_id, setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value'
         );
+        $updatedKeys = [];
         foreach ($b as $k => $v) {
             if (!is_string($k)) continue;
             $stmt->execute([$tenantId, $k, is_scalar($v) ? (string)$v : json_encode($v, JSON_UNESCAPED_UNICODE)]);
+            $updatedKeys[] = $k;
+        }
+        // 🔧 إصلاح نقص في سجل التدقيق: كان هذا هو الملف الوحيد ذو معالج كتابة
+        // (POST) في كامل الباك-إند بلا أي استدعاء audit() — أي أن تعديل
+        // إعدادات المتجر (الضرائب، طرق الدفع، بيانات الفوترة، ...) لم يكن
+        // يُترك أي أثر في سجل التدقيق على عكس كل نقاط النهاية الأخرى
+        // (products.php، employees.php، إلخ). التصحيح: تسجيل مفاتيح
+        // الإعدادات المُحدَّثة فعلياً.
+        if (!empty($updatedKeys)) {
+            audit(
+                'تحديث إعدادات المتجر: ' . implode(', ', $updatedKeys),
+                null,
+                'info',
+                $tenantId
+            );
         }
         json_ok(['success' => true, 'updated' => count($b)]);
         break;
