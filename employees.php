@@ -84,6 +84,24 @@ switch ($method) {
             $netAmount  = $baseSalary + $allowances - $deductions;
             if ($netAmount < 0) json_error('صافي الراتب لا يمكن أن يكون سالباً');
 
+            // 🔧 إصلاح جوهري خطير (نفس فئة ثقة idempotency المُطبّقة في
+            // vouchers.php/transfers.php): صرف الراتب يُنشئ معرّفاً جديداً من
+            // الخادم في كل مرة — إعادة محاولة من طابور الأوفلاين (بعد
+            // فقدان استجابة ناجحة) كانت تُنشئ صرف راتب مكرّر وتُخصَم
+            // المبلغ مرتين من الصندوق. الإصلاح: التحقق من client_ref قبل
+            // المعاملة.
+            $clientRef = trim($body['client_ref'] ?? $body['_localId'] ?? '');
+            if ($clientRef !== '') {
+                $dupStmt = $pdo->prepare(
+                    'SELECT id, net_amount FROM payroll_runs WHERE tenant_id = ? AND client_ref = ? LIMIT 1'
+                );
+                $dupStmt->execute([$tenantId, $clientRef]);
+                $dup = $dupStmt->fetch();
+                if ($dup) {
+                    json_ok(['success' => true, 'id' => $dup['id'], 'net_amount' => (float)$dup['net_amount'], 'idempotent' => true]);
+                }
+            }
+
             $id = 'PR-' . round(microtime(true) * 1000);
 
             try {
@@ -140,12 +158,12 @@ switch ($method) {
                 $ins = $pdo->prepare(
                     'INSERT INTO payroll_runs
                        (id, employee_id, period, base_salary, allowances, deductions,
-                        net_amount, currency, cash_account_id, status, paid_at, notes, tenant_id)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, \'\'), \'paid\', NOW(), ?, ?)'
+                        net_amount, currency, cash_account_id, status, paid_at, notes, tenant_id, client_ref)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, \'\'), \'paid\', NOW(), ?, ?, NULLIF(?, \'\'))'
                 );
                 $ins->execute([
                     $id, $employeeId, $period, $baseSalary, $allowances, $deductions,
-                    $netAmount, $emp['currency'], $cashAccountId, $notes, $tenantId,
+                    $netAmount, $emp['currency'], $cashAccountId, $notes, $tenantId, $clientRef,
                 ]);
 
                 // 🤖 الترحيل المحاسبي الذرّي (فحص معماري شامل — طلب المستخدم

@@ -185,6 +185,23 @@ switch ($method) {
         }
         if ($totalDebit <= 0) json_error('لا يمكن إنشاء قيد بقيمة صفرية');
 
+        // 🔧 إصلاح جوهري خطير (نفس فئة ثقة idempotency المُطبّقة في
+        // vouchers.php/transfers.php/employees.php): قيد اليومية اليدوي يُنشأ
+        // بمعرّف جديد من الخادم في كل مرة — إعادة محاولة من طابور
+        // الأوفلاين كانت تُنشئ قيداً محاسبياً مكرّراً. الإصلاح: التحقق
+        // من client_ref قبل المعاملة.
+        $clientRef = trim($body['client_ref'] ?? $body['_localId'] ?? '');
+        if ($clientRef !== '') {
+            $dupStmt = $pdo->prepare(
+                'SELECT id, entry_number FROM journal_entries WHERE tenant_id = ? AND client_ref = ? LIMIT 1'
+            );
+            $dupStmt->execute([$tenantId, $clientRef]);
+            $dup = $dupStmt->fetch();
+            if ($dup) {
+                json_ok(['success' => true, 'id' => $dup['id'], 'entry_number' => $dup['entry_number'], 'idempotent' => true]);
+            }
+        }
+
         $id = 'JE-' . round(microtime(true) * 1000);
         $entryNumber = $body['entry_number'] ?? $body['entryNumber'] ?? ('JE-' . substr($id, -6));
 
@@ -192,12 +209,12 @@ switch ($method) {
             $pdo->beginTransaction();
 
             $ins = $pdo->prepare(
-                'INSERT INTO journal_entries (id, entry_number, date, description, reference, status, created_by, tenant_id)
-                 VALUES (?, ?, COALESCE(NULLIF(?, \'\')::timestamp, NOW()), ?, ?, \'posted\', ?, ?)'
+                'INSERT INTO journal_entries (id, entry_number, date, description, reference, status, created_by, tenant_id, client_ref)
+                 VALUES (?, ?, COALESCE(NULLIF(?, \'\')::timestamp, NOW()), ?, ?, \'posted\', ?, ?, NULLIF(?, \'\'))'
             );
             $ins->execute([
                 $id, $entryNumber, $date, $description, $reference,
-                $_SERVER['HTTP_X_USER_EMAIL'] ?? '', $tenantId,
+                $_SERVER['HTTP_X_USER_EMAIL'] ?? '', $tenantId, $clientRef,
             ]);
 
             // ⚡ تحسين أداء: إعداد الاستعلامات مرة واحدة خارج الحلقة بدل إعادة
