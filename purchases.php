@@ -22,7 +22,7 @@ switch ($method) {
         $tenantId = tenant_id_from_auth($auth);
         $b   = input_json();
         $id  = trim($b['id'] ?? '');
-        if ($id === '') $id = 'PO-' . time();
+        if ($id === '') $id = 'PO-' . round(microtime(true) * 1000);
         $items = $b['items'] ?? [];
         // 🆕 المرحلة 7 من إعادة التصميم: خصم + طريقة دفع + صندوق نقدي
         $discount      = (float)($b['discount'] ?? 0);
@@ -41,6 +41,22 @@ switch ($method) {
         // رفض تحسباً لاستخدامات مستقبلية كسجل ملاحظة بلا قيمة مالية).
         if ($total <= 0 && is_array($items) && count($items) > 0) {
             json_error('إجمالي فاتورة الشراء يجب أن يكون أكبر من صفر');
+        }
+
+        // 🔧 إصلاح جوهري خطير (نفس علة invoices.php المكتشفة والمُصلَحة للتو):
+        // زيادة المخزون وخصم رصيد الصندوق وتسجيل حركة الصندوق كانت تُنفَّذ
+        // بلا أي حارس idempotency — فإعادة محاولة أوفلاين لفاتورة شراء نجحت
+        // فعلياً في المرة الأولى (لكن انقطع الاتصال قبل استلام الرد) كانت
+        // تزيد المخزون وتخصم من الصندوق مرة ثانية لنفس الفاتورة. الإصلاح:
+        // التحقق من وجود الفاتورة فعلياً في قاعدة البيانات أولاً؛ إن وُجدت،
+        // نعتبرها إعادة محاولة متجاهَلة (idempotent no-op) بدل تنفيذ آثارها
+        // الجانبية مرة أخرى.
+        $existsStmt = $pdo->prepare('SELECT 1 FROM purchases WHERE id = ? AND tenant_id = ? LIMIT 1');
+        $existsStmt->execute([$id, $tenantId]);
+        if ($existsStmt->fetchColumn() !== false) {
+            audit("purchase $id (إعادة محاولة متجاهَلة — موجودة بالفعل)", null, 'info', $tenantId);
+            json_ok(['success' => true, 'id' => $id, 'idempotent' => true]);
+            break;
         }
 
         $pdo->beginTransaction();

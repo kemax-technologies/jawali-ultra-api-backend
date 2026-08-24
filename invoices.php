@@ -116,7 +116,7 @@ switch ($method) {
         $tenantId = tenant_id_from_auth($auth);
         $body = input_json();
         $id   = trim($body['id'] ?? '');
-        if ($id === '') $id = 'INV-' . time();
+        if ($id === '') $id = 'INV-' . round(microtime(true) * 1000);
 
         $items = $body['items'] ?? [];
         if (!is_array($items)) $items = [];
@@ -127,6 +127,29 @@ switch ($method) {
         $cashAccountId = trim($body['cash_account_id'] ?? $body['cashAccountId'] ?? '');
         $paymentMethod = $body['payment_method'] ?? $body['paymentMethod'] ?? 'نقدي';
         $total         = (float)($body['total'] ?? 0);
+
+        // 🔧 إصلاح جوهري خطير (فحص شامل — منع التكرار عند إعادة محاولة
+        // الأوفلاين): الفاتورة تُحفَظ عبر ON CONFLICT(id) DO UPDATE، لكن
+        // Flutter لا يعرض شاشة "تعديل فاتورة" أصلاً — كل استدعاء POST هنا
+        // هو "إنشاء" منطقياً حتى لو تكرر معرّفه (نفس معرّف مُولَّد على
+        // العميل تُعاد إعادة محاولة إرساله بعد فشل شبكي، تماماً كما وقع
+        // فعلياً في cashboxes.php/warehouses.php). المشكلة: خصم المخزون
+        // وإضافة رصيد الصندوق وتسجيل حركة الصندوق كانت تُنفَّذ *دون أي حارس
+        // idempotency* في كل مرة — فإعادة محاولة لفاتورة نجحت فعلياً في
+        // المرة الأولى (لكن انقطع الاتصال قبل أن يستلم العميل الرد) كانت
+        // تُخصِم المخزون وتُضيف للصندوق مرة ثانية لنفس الفاتورة تماماً، رغم
+        // أن الترحيل المحاسبي (post_journal_entry_atomic) محمي بالفعل من
+        // هذا التكرار. الإصلاح: التحقق أولاً هل الفاتورة موجودة فعلياً في
+        // قاعدة البيانات؛ إن كانت موجودة، لا نُعيد تنفيذ أي من آثارها
+        // الجانبية (مخزون/صندوق/محاسبة) — فقط نُعيد نجاحاً فورياً (idempotent
+        // no-op) لأن الفاتورة (وكل آثارها) قد سُجِّلت بالفعل بنجاح.
+        $existsStmt = $pdo->prepare('SELECT 1 FROM invoices WHERE id = ? AND tenant_id = ? LIMIT 1');
+        $existsStmt->execute([$id, $tenantId]);
+        if ($existsStmt->fetchColumn() !== false) {
+            audit("invoice $id (إعادة محاولة متجاهَلة — موجودة بالفعل)", $auth['email'] ?? null, 'info', $tenantId);
+            json_ok(['success' => true, 'id' => $id, 'idempotent' => true]);
+            break;
+        }
 
         $pdo->beginTransaction();
         try {
