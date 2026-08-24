@@ -122,10 +122,18 @@ switch ($method) {
             $code = trim($body['code'] ?? '');
             $name = trim($body['name'] ?? '');
             if ($code === '' || $name === '') json_error('code و name مطلوبان');
-            $isNew = $id === '';
             // ✅ Multi-Tenant: id يدمج tenant_id لمنع تعارض المفتاح الأساسي العام
             // بين متاجر مختلفين لو استعملوا نفس رمز الحساب (code)
-            if ($isNew) $id = 'COA-' . $tenantId . '-' . $code;
+            if ($id === '') $id = 'COA-' . $tenantId . '-' . $code;
+            // 🔧 إصلاح استباقي (نفس علة cashboxes.php/warehouses.php/assets.php/
+            // employees.php المُكتشَفة بالفحص المباشر): "$isNew" لا يجوز أن يعتمد
+            // على خلو المعرّف المُرسَل فقط، لأن معرّف الحساب هنا مُولَّد بشكل حتمي
+            // من (tenant_id + code) فقد يصل غير فارغ من العميل حتى لو كان الحساب
+            // غير موجود فعليًا بعد (أو تم توليده مسبقًا على العميل لإعادة محاولة
+            // متكررة). الفحص الصحيح: وجود الصف فعليًا في قاعدة البيانات.
+            $existsStmt = $pdo->prepare('SELECT 1 FROM chart_of_accounts WHERE id = ? AND tenant_id = ? LIMIT 1');
+            $existsStmt->execute([$id, $tenantId]);
+            $isNew = $existsStmt->fetchColumn() === false;
 
             $type = $body['type'] ?? 'asset';
             $parentId = trim($body['parent_id'] ?? $body['parentId'] ?? '');

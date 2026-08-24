@@ -177,11 +177,22 @@ switch ($method) {
         }
 
         // ── إنشاء/تحديث موظف ────────────────────────────────────────────────
+        // 🔧 إصلاح استباقي (نفس علة cashboxes.php/warehouses.php المُكتشَفة
+        // بالفحص المباشر): "$isNew" لا يجوز أن يعتمد على خلو المعرّف فقط، لأن
+        // أي معرّف يُولَّد على العميل مستقبلاً (idempotent retry) سيُرسَل غير
+        // فارغ فيُوجَّه خطأً لمسار "تحديث" ويفشل بـ 404 حتماً. الفحص الصحيح:
+        // وجود الصف فعلياً في قاعدة البيانات.
         $id   = trim($body['id'] ?? '');
         $name = trim($body['name'] ?? '');
         if ($name === '') json_error('اسم الموظف مطلوب');
-        $isNew = $id === '';
-        if ($isNew) $id = 'EMP-' . round(microtime(true) * 1000);
+        if ($id === '') {
+            $isNew = true;
+            $id = 'EMP-' . round(microtime(true) * 1000);
+        } else {
+            $existsStmt = $pdo->prepare('SELECT 1 FROM employees WHERE id = ? AND tenant_id = ? LIMIT 1');
+            $existsStmt->execute([$id, $tenantId]);
+            $isNew = $existsStmt->fetchColumn() === false;
+        }
 
         $phone      = $body['phone']      ?? '';
         $jobTitle   = $body['job_title']  ?? $body['jobTitle']   ?? '';

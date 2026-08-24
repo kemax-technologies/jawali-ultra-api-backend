@@ -35,8 +35,19 @@ switch ($method) {
         $id = trim($b['id'] ?? '');
         $name = trim($b['name'] ?? '');
         if ($name === '') json_error('اسم الأصل مطلوب');
-        $isNew = $id === '';
-        if ($isNew) $id = 'AS-' . round(microtime(true) * 1000);
+        // 🔧 إصلاح استباقي (نفس علة cashboxes.php/warehouses.php المُكتشَفة
+        // بالفحص المباشر): "$isNew" لا يجوز أن يعتمد على خلو المعرّف فقط، لأن
+        // أي معرّف يُولَّد على العميل مستقبلاً (idempotent retry) سيُرسَل غير
+        // فارغ فيُوجَّه خطأً لمسار "تحديث" ويفشل بـ 404 حتماً. الفحص الصحيح:
+        // وجود الصف فعلياً في قاعدة البيانات.
+        if ($id === '') {
+            $isNew = true;
+            $id = 'AS-' . round(microtime(true) * 1000);
+        } else {
+            $existsStmt = $pdo->prepare('SELECT 1 FROM assets WHERE id = ? AND tenant_id = ? LIMIT 1');
+            $existsStmt->execute([$id, $tenantId]);
+            $isNew = $existsStmt->fetchColumn() === false;
+        }
 
         $category         = $b['category'] ?? 'أخرى';
         $purchaseDate     = $b['purchaseDate'] ?? $b['purchase_date'] ?? date('Y-m-d');
