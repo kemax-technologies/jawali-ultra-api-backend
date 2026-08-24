@@ -281,6 +281,32 @@ switch ($method) {
         }
         if ($amount <= 0) json_error('المبلغ يجب أن يكون أكبر من صفر');
 
+        // 🔧 إصلاح جوهري خطير (فحص شامل — ثغرة idempotency في عمليات
+        // الإنشاء التي "يُصدر فيها الخادم معرّفاً جديداً"): شاشة التحويلات
+        // تُنشئ السجل محلياً بمعرّف مؤقت (LOCAL-...) ثم تعتمد على الخادم
+        // لإصدار id/receive_code الحقيقيين — أي أن كل إعادة محاولة من طابور
+        // الأوفلاين (بعد فقدان الاستجابة الأصلية رغم نجاح الطلب فعلياً على
+        // الخادم) كانت تُنشئ تحويلاً مالياً *جديداً تماماً* بمعرّف مختلف،
+        // فيُودَع/يُخصَم المبلغ مرتين بصمت. الإصلاح: العميل يُرسل الآن
+        // _localId الفريد (ثابت عبر كل إعادات المحاولة لنفس الطلب) في
+        // client_ref؛ نتحقق أولاً من وجود تحويل بنفس client_ref لهذا
+        // المتجر — وإن وُجد نُعيده كنجاح idempotent فوراً بلا أي تأثير
+        // نقدي إضافي.
+        $clientRef = trim($body['client_ref'] ?? $body['_localId'] ?? '');
+        if ($clientRef !== '') {
+            $dupStmt = $pdo->prepare(
+                'SELECT id, receive_code FROM money_transfers WHERE tenant_id = ? AND client_ref = ? LIMIT 1'
+            );
+            $dupStmt->execute([$tenantId, $clientRef]);
+            $dup = $dupStmt->fetch();
+            if ($dup) {
+                json_ok([
+                    'success' => true, 'id' => $dup['id'],
+                    'receive_code' => $dup['receive_code'], 'idempotent' => true,
+                ]);
+            }
+        }
+
         $total = $amount + $commission;
         $id    = 'TR-' . round(microtime(true) * 1000);
         $code  = generate_receive_code($pdo, $tenantId);
@@ -318,12 +344,12 @@ switch ($method) {
                 'INSERT INTO money_transfers
                     (id, tenant_id, sender_name, sender_phone, receiver_name, receiver_phone,
                      amount, commission, total, currency, cash_account_id, receive_code,
-                     status, notes, created_by)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+                     status, notes, created_by, client_ref)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, \'\'))'
             )->execute([
                 $id, $tenantId, $senderName, $senderPhone, $receiverName, $receiverPhone,
                 $amount, $commission, $total, $currency, $cashAccountId ?: null, $code,
-                'pending', $notes, $_SERVER['HTTP_X_USER_EMAIL'] ?? null,
+                'pending', $notes, $_SERVER['HTTP_X_USER_EMAIL'] ?? null, $clientRef,
             ]);
 
             $pdo->commit();

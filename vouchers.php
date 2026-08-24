@@ -74,6 +74,36 @@ switch ($method) {
         $voucherNumber = $body['voucher_number'] ?? $body['voucherNumber']
             ?? (($type === 'receipt') ? 'REC-' : 'PAY-') . substr($id, -6);
 
+        // 🔧 إصلاح جوهري خطير (فحص شامل — ثغرة idempotency في كل عمليات
+        // الإنشاء التي "يُصدر فيها الخادم معرّفاً جديداً"): على عكس
+        // invoices.php/purchases.php (التي يُرسل عميلها معرّفاً ثابتاً منذ
+        // البداية)، شاشة السندات تُنشئ السجل محلياً بمعرّف مؤقت (LOCAL-...)
+        // ثم تعتمد على الخادم لإصدار id/voucher_number الحقيقيين — أي أن كل
+        // إعادة محاولة من طابور الأوفلاين (بعد فقدان الاستجابة الأصلية رغم
+        // نجاح الطلب فعلياً على الخادم) كانت تُنشئ سنداً *جديداً تماماً*
+        // بمعرّف مختلف، فتُخصَم/تُضاف حركة نقدية مكرّرة بصمت (بلا أي تعارض
+        // مفتاح أساسي يُنبّه أحداً). الإصلاح: العميل يُرسل الآن _localId
+        // الفريد (الذي يبقى ثابتاً عبر كل إعادات المحاولة لنفس الطلب) في
+        // client_ref؛ نتحقق أولاً إن كان سنداً بنفس client_ref موجوداً
+        // مسبقاً لهذا المتجر — وإن وُجد نُعيده كنجاح idempotent فوراً بلا أي
+        // تأثير نقدي إضافي.
+        $clientRef = trim($body['client_ref'] ?? $body['_localId'] ?? '');
+        if ($clientRef !== '') {
+            $dupStmt = $pdo->prepare(
+                'SELECT id, voucher_number FROM vouchers WHERE tenant_id = ? AND client_ref = ? LIMIT 1'
+            );
+            $dupStmt->execute([$tenantId, $clientRef]);
+            $dup = $dupStmt->fetch();
+            if ($dup) {
+                json_ok([
+                    'success'        => true,
+                    'id'             => $dup['id'],
+                    'voucher_number' => $dup['voucher_number'],
+                    'idempotent'     => true,
+                ]);
+            }
+        }
+
         try {
             $pdo->beginTransaction();
 
@@ -147,13 +177,13 @@ switch ($method) {
             $ins = $pdo->prepare(
                 'INSERT INTO vouchers
                    (id, tenant_id, type, voucher_number, party_name, party_phone, cash_account_id,
-                    amount, currency, category, description, date, created_by)
-                 VALUES (?, ?, ?, ?, ?, ?, NULLIF(?, \'\'), ?, ?, ?, ?, NOW(), ?)'
+                    amount, currency, category, description, date, created_by, client_ref)
+                 VALUES (?, ?, ?, ?, ?, ?, NULLIF(?, \'\'), ?, ?, ?, ?, NOW(), ?, NULLIF(?, \'\'))'
             );
             $ins->execute([
                 $id, $tenantId, $type, $voucherNumber, $partyName, $partyPhone, $cashAccountId,
                 $amount, $currency, $category, $description,
-                $_SERVER['HTTP_X_USER_EMAIL'] ?? '',
+                $_SERVER['HTTP_X_USER_EMAIL'] ?? '', $clientRef,
             ]);
 
             // 🤖 الترحيل المحاسبي الذرّي (فحص معماري شامل — طلب المستخدم
