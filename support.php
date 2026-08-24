@@ -129,15 +129,22 @@ switch ($action) {
         $isPro = (int)($u->fetchColumn() ?: 0) === 1;
         $priority = $isPro ? 'high' : 'normal';
 
+        // 🔧 ملاحظة تحسينية (فحص شامل — مراجعة ثانية): lastInsertId() هنا كان
+        // مؤمَّناً فعلاً لأنه يُستدعى *داخل* نفس المعاملة (beginTransaction)
+        // التي تحوي جملة INSERT، وPgBouncer Transaction Pooler يُثبِّت اتصال
+        // backend واحد طوال عمر المعاملة كاملة — لا خطر تبديل اتصال هنا (على
+        // عكس expenses.php/pro.php/scanner_scan.php حيث كانت الجملتان بلا
+        // معاملة مُغلِّفة). نستخدم مع ذلك RETURNING id للتناسق والوضوح مع
+        // بقية الملفات المُصلَحة، وتجنّباً لأي شك مستقبلي.
         $pdo->beginTransaction();
         try {
             $ins = $pdo->prepare(
                 'INSERT INTO support_tickets
                     (user_id, user_email, subject, status, priority, is_pro_ticket, tenant_id)
-                 VALUES (?,?,?, \'open\', ?, ?, ?)'
+                 VALUES (?,?,?, \'open\', ?, ?, ?) RETURNING id'
             );
             $ins->execute([$userId, $email, $subject, $priority, $isPro ? 1 : 0, $tenantId]);
-            $ticketId = (int)$pdo->lastInsertId();
+            $ticketId = (int)$ins->fetchColumn();
 
             $msg = $pdo->prepare(
                 'INSERT INTO support_messages (ticket_id, sender_role, sender_email, message, tenant_id)

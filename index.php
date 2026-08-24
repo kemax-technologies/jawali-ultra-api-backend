@@ -2,13 +2,18 @@
 require_once __DIR__ . '/_db.php';
 
 // نقطة المعاينة الافتراضية — تفيد للتحقق من تشغيل API
+// 🔒 إصلاح أمني: كان هذا المسار العام (بلا أي مصادقة) يُرجع نص إصدار
+// PostgreSQL الكامل والتفصيلي (SELECT VERSION()) لأي زائر مجهول — ما يُسهّل
+// على مهاجم محتمل تحديد الإصدار الدقيق لاستهداف ثغرات (CVE) معروفة خاصة به
+// (Information Disclosure / Fingerprinting). الآن نُنفّذ فحص اتصال بسيط فقط
+// (SELECT 1) ونُرجع حالة الاتصال (متصلة/غير متصلة) دون كشف أي تفصيل داخلي.
 try {
-    $version = db()->query('SELECT VERSION() AS v')->fetch()['v'] ?? '?';
+    db()->query('SELECT 1');
     json_ok([
         'app'        => 'Jawali Ultra API',
         'version'    => '9.0 — Credit & Dual Pricing',
         'status'     => 'ready',
-        'database'   => $version,
+        'database'   => 'متصلة ✅',
         'server_time'=> date('c'),
         'features'   => [
             '💳 نظام البيع بالدَين والذمم المالية',

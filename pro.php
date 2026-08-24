@@ -120,22 +120,27 @@ switch ($action) {
             json_error('لديك طلب ترقية قيد المراجعة بالفعل — يرجى الانتظار', 409);
         }
 
+        // 🔧 إصلاح جوهري (فحص شامل — مراجعة ثانية، نفس نمط إصلاح
+        // expenses.php): استبدال lastInsertId() المنفصل (غير آمن عبر
+        // Transaction Pooler لـ PgBouncer — راجع التعليق التفصيلي في
+        // expenses.php) بـ "RETURNING id" الذرّي ضمن جملة INSERT نفسها.
         $ins = $pdo->prepare(
             'INSERT INTO pro_requests
                 (user_id, user_email, plan, amount, currency, bank_account,
                  transfer_reference, sender_name, notes, status, tenant_id)
-             VALUES (?,?,?,?,?,?,?,?,?, \'pending\', ?)'
+             VALUES (?,?,?,?,?,?,?,?,?, \'pending\', ?) RETURNING id'
         );
         $ins->execute([
             $userId, $email, $plan, $amount, $currency, $bankAccount,
             $reference, $senderName, $notes, $tenantId,
         ]);
+        $requestId = (int)$ins->fetchColumn();
 
         audit('طلب ترقية Pro جديد', $email, 'info', $tenantId);
         json_ok([
             'success' => true,
             'message' => 'تم استلام طلبك وسيتم تفعيل حسابك بعد مراجعة التحويل',
-            'request_id' => (int)$pdo->lastInsertId(),
+            'request_id' => $requestId,
         ]);
         break;
     }

@@ -206,16 +206,27 @@ if ($windowCount > SCANNER_RATE_LIMIT) {
 }
 
 // ── ✅ إدراج الباركود في Queue (scanner_codes) مع دعم Idempotency ────────────
+// 🔧 إصلاح جوهري (فحص شامل — مراجعة ثانية، نفس نمط إصلاح expenses.php/
+// pro.php): استبدال lastInsertId() المنفصل بـ "RETURNING id" ضمن جملة
+// INSERT نفسها — غير آمن سابقاً عبر Supabase PgBouncer (Transaction Pooler،
+// منفذ 6543) لأن lastInsertId() يعتمد على lastval() المرتبط بجلسة اتصال
+// backend محدَّدة، وقد يُوجَّه الاستعلام التالي (lastval) إلى اتصال backend
+// مختلف تماماً تحت الحمل المتزامن، فيفشل بخطأ "lastval is not yet defined
+// in this session" — يظهر كخطأ 500 عشوائي متقطّع للمستخدم رغم نجاح إدراج
+// الباركود فعلياً في قاعدة البيانات.
 $newCodeId = null;
 try {
     if ($idemKey !== '') {
         // ✅ تحويل PostgreSQL: INSERT IGNORE → INSERT ... ON CONFLICT DO NOTHING
         // (يعتمد على قيد uq_idempotency الموجود في scanner_codes)
-        // محاولة إدراج — إذا كان المفتاح مكرراً يُتجاهَل بصمت
+        // محاولة إدراج — إذا كان المفتاح مكرراً يُتجاهَل بصمت. ملاحظة: عند
+        // تعارض (DO NOTHING) لا يُعاد أي صف من RETURNING، وهذا متوقّع تماماً
+        // ونتعامل معه أدناه عبر rowCount() === 0 قبل قراءة id.
         $stmtInsert = db()->prepare(
             'INSERT INTO scanner_codes (session_id, code, idempotency_key, tenant_id)
              VALUES (?, ?, ?, ?)
-             ON CONFLICT (session_id, idempotency_key) DO NOTHING'
+             ON CONFLICT (session_id, idempotency_key) DO NOTHING
+             RETURNING id'
         );
         $stmtInsert->execute([$sessionId, $code, $idemKey, $tenantId]);
         if ($stmtInsert->rowCount() === 0) {
@@ -228,13 +239,13 @@ try {
                 'idempotent'   => true,
             ]);
         }
-        $newCodeId = (int)db()->lastInsertId();
+        $newCodeId = (int)$stmtInsert->fetchColumn();
     } else {
         $stmtInsert = db()->prepare(
-            'INSERT INTO scanner_codes (session_id, code, tenant_id) VALUES (?, ?, ?)'
+            'INSERT INTO scanner_codes (session_id, code, tenant_id) VALUES (?, ?, ?) RETURNING id'
         );
         $stmtInsert->execute([$sessionId, $code, $tenantId]);
-        $newCodeId = (int)db()->lastInsertId();
+        $newCodeId = (int)$stmtInsert->fetchColumn();
     }
 } catch (Exception $e) {
     error_log('[Jawali][scanner_scan] فشل إدراج الباركود: ' . $e->getMessage());
