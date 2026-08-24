@@ -145,6 +145,23 @@ switch ($method) {
         if ($partyName === '') json_error('party_name مطلوب');
         if (!is_array($items) || count($items) === 0) json_error('يجب إضافة عنصر واحد على الأقل');
 
+        // 🔧 إصلاح جوهري خطير (نفس فئة ثغرة idempotency المُطبَّقة في
+        // vouchers.php/transfers.php/employees.php/accounting.php): العرض
+        // يُنشأ بمعرّف جديد من الخادم في كل مرة — إعادة محاولة من طابور
+        // الأوفلاين كانت تُنشئ عرضاً/طلباً مكرراً. الإصلاح: التحقق من
+        // client_ref قبل الإدراج.
+        $clientRef = trim($body['client_ref'] ?? $body['_localId'] ?? '');
+        if ($clientRef !== '') {
+            $dupStmt = $pdo->prepare(
+                'SELECT id, quote_number FROM quotations WHERE tenant_id = ? AND client_ref = ? LIMIT 1'
+            );
+            $dupStmt->execute([$tenantId, $clientRef]);
+            $dup = $dupStmt->fetch();
+            if ($dup) {
+                json_ok(['success' => true, 'id' => $dup['id'], 'quote_number' => $dup['quote_number'], 'idempotent' => true]);
+            }
+        }
+
         $id = $body['id'] ?? ('Q-' . round(microtime(true) * 1000));
         $quoteNumber = $body['quote_number'] ?? $body['quoteNumber']
             ?? (($type === 'sale') ? 'QT-' : 'PR-') . substr($id, -6);
@@ -152,14 +169,14 @@ switch ($method) {
         $stmt = $pdo->prepare(
             'INSERT INTO quotations
                (id, tenant_id, quote_number, type, party_name, party_phone, items_json,
-                subtotal, discount, tax, total, currency, valid_until, status, notes, date, created_by)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, \'\')::date, \'draft\', ?, NOW(), ?)'
+                subtotal, discount, tax, total, currency, valid_until, status, notes, date, created_by, client_ref)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, \'\')::date, \'draft\', ?, NOW(), ?, NULLIF(?, \'\'))'
         );
         $stmt->execute([
             $id, $tenantId, $quoteNumber, $type, $partyName, $partyPhone,
             json_encode($items, JSON_UNESCAPED_UNICODE),
             $subtotal, $discount, $tax, $total, $currency, $validUntil, $notes,
-            $_SERVER['HTTP_X_USER_EMAIL'] ?? '',
+            $_SERVER['HTTP_X_USER_EMAIL'] ?? '', $clientRef,
         ]);
 
         audit("create quotation $id type=$type total=$total party=$partyName", null, 'info', $tenantId);
