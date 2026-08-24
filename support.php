@@ -36,6 +36,21 @@ $pdo    = db();
 function support_ensure_tables(): void {
     static $done = false;
     if ($done) return;
+
+    // 🔒 إصلاح حرج (اكتُشف بعد النشر على الإنتاج): كانت جمل CREATE INDEX
+    // الخاصة بعمود tenant_id (idx_support_tickets_tenant / idx_support_messages_tenant)
+    // ضمن نفس استعلام exec() الذي يحتوي CREATE TABLE IF NOT EXISTS. على قواعد
+    // بيانات كان فيها الجدولان مُنشَأين مسبقاً (من نسخة أقدم للمشروع لا تحتوي
+    // tenant_id) — لا يفعل CREATE TABLE IF NOT EXISTS شيئاً (الجدول موجود
+    // فيُتجاوَز بصمت)، لكن CREATE INDEX ... ON support_tickets(tenant_id)
+    // كانت تُنفَّذ فوراً بعده وتفشل بخطأ PostgreSQL "column tenant_id does not
+    // exist" — لأن ALTER TABLE ADD COLUMN IF NOT EXISTS تنفيذها كان يأتي في
+    // استعلام لاحق (منفصل)، لم تكن الدالة تصل إليه أبداً لأن exec() الأول
+    // كان يرمي PDOException غير مُعالَجة أولاً (بلا try/catch) — مما كان يُسقط
+    // كل نقطة نهاية support.php بالكامل (500) لكل مستخدم حاول فتح تذكرة دعم.
+    // الحل: فصل إنشاء الجدولين + فهارسهما "الأساسية" (بلا فهرس tenant_id) عن
+    // ترقية tenant_id، ثم إنشاء فهارس tenant_id بعد إضافة العمود مباشرةً ضمن
+    // نفس حلقة try/catch الآمنة أدناه.
     db()->exec("
         CREATE TABLE IF NOT EXISTS support_tickets (
             id SERIAL PRIMARY KEY,
@@ -52,7 +67,6 @@ function support_ensure_tables(): void {
         CREATE INDEX IF NOT EXISTS idx_support_tickets_user ON support_tickets(user_id);
         CREATE INDEX IF NOT EXISTS idx_support_tickets_status ON support_tickets(status);
         CREATE INDEX IF NOT EXISTS idx_support_tickets_priority ON support_tickets(priority);
-        CREATE INDEX IF NOT EXISTS idx_support_tickets_tenant ON support_tickets(tenant_id);
 
         CREATE TABLE IF NOT EXISTS support_messages (
             id SERIAL PRIMARY KEY,
@@ -64,19 +78,30 @@ function support_ensure_tables(): void {
             created_at TIMESTAMP NOT NULL DEFAULT now()
         );
         CREATE INDEX IF NOT EXISTS idx_support_messages_ticket ON support_messages(ticket_id);
-        CREATE INDEX IF NOT EXISTS idx_support_messages_tenant ON support_messages(tenant_id);
     ");
     // ✅ Multi-Tenant: ترقية آمنة إن كانت الجداول موجودة مسبقاً بدون tenant_id
+    // (كل جملة معزولة في try/catch مستقل — فشل جملة واحدة لا يوقف الباقي)
     $upgrades = [
         "ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS tenant_id INTEGER",
         "ALTER TABLE support_messages ADD COLUMN IF NOT EXISTS tenant_id INTEGER",
+        // فهارس tenant_id تُنشأ هنا (بعد ضمان وجود العمود أعلاه بالتأكيد)
+        "CREATE INDEX IF NOT EXISTS idx_support_tickets_tenant ON support_tickets(tenant_id)",
+        "CREATE INDEX IF NOT EXISTS idx_support_messages_tenant ON support_messages(tenant_id)",
     ];
     foreach ($upgrades as $sql) {
-        try { db()->exec($sql); } catch (Exception $e) { /* العمود موجود مسبقاً */ }
+        try { db()->exec($sql); } catch (Exception $e) { /* العمود/الفهرس موجود مسبقاً */ }
     }
     $done = true;
 }
-support_ensure_tables();
+// 🔒 حماية دفاعية إضافية (بعد حادثة الإنتاج أعلاه): أي خطأ غير متوقع أثناء
+// تهيئة الجدولين يُسجَّل في error_log ولا يُعرض كـ stack trace خام للعميل —
+// نفس نمط الحماية المطبَّق في scanner_session.php's scanner_ensure_tables().
+try {
+    support_ensure_tables();
+} catch (Exception $e) {
+    error_log('[Jawali][support] فشل تهيئة الجداول: ' . $e->getMessage());
+    json_error('خطأ داخلي في الخادم', 500);
+}
 
 // 🔒 مُعطَّلة عمداً: إدارة تذاكر الدعم (رؤية الكل + الرد كإدارة + الإغلاق) هي
 // صلاحية منصّة حصرية لمطوّر التطبيق عبر dev_support.php فقط — وليست صلاحية

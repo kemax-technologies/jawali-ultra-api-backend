@@ -22,6 +22,19 @@
     }
 })();
 
+// 🔒 إصلاح حرج (اكتُشف عبر اختبار الإنتاج المباشر — حادثة support.php):
+// PHP كان يعرض أي Fatal Error/Uncaught Exception كـ stack trace خام كامل
+// في استجابة HTTP (يكشف مسارات الخادم، بنية الكود، وأسماء الجداول/الأعمدة
+// للعميل). نُعطِّل عرض الأخطاء دائماً في الإنتاج (JAWALI_DEV_MODE != '1')
+// ونكتفي بتسجيلها في سجل الخادم (error_log) — وهذا لا يستبدل معالجة try/catch
+// المحلية في كل ملف، بل يحمي كأي "شبكة أمان" أخيرة من أي خطأ غير متوقع لم
+// تتم معالجته بعد. يُوضَع بعد تحميل .env مباشرة لضمان قراءة JAWALI_DEV_MODE
+// بشكل صحيح سواء أتت من .env المحلي أو من متغيرات بيئة Render الحقيقية.
+$__jawaliDevMode = getenv('JAWALI_DEV_MODE') === '1';
+error_reporting(E_ALL);
+ini_set('display_errors', $__jawaliDevMode ? '1' : '0');
+ini_set('log_errors', '1');
+
 // ── إعدادات الاتصال بـ Supabase (PostgreSQL) — عدّل عند الحاجة ─────────────────
 // 💡 احصل على هذه القيم من: Supabase Dashboard → Project Settings → Database
 //    - DB_HOST: مثل db.xxxxxxxxxxxx.supabase.co (اتصال مباشر)
