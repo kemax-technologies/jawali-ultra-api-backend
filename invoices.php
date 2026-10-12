@@ -128,48 +128,16 @@ switch ($method) {
         $paymentMethod = $body['payment_method'] ?? $body['paymentMethod'] ?? 'نقدي';
         $total         = (float)($body['total'] ?? 0);
 
-        // 🔧 إصلاح جوهري خطير (فحص شامل — منع التكرار عند إعادة محاولة
-        // الأوفلاين): الفاتورة تُحفَظ عبر ON CONFLICT(id) DO UPDATE، لكن
-        // Flutter لا يعرض شاشة "تعديل فاتورة" أصلاً — كل استدعاء POST هنا
-        // هو "إنشاء" منطقياً حتى لو تكرر معرّفه (نفس معرّف مُولَّد على
-        // العميل تُعاد إعادة محاولة إرساله بعد فشل شبكي، تماماً كما وقع
-        // فعلياً في cashboxes.php/warehouses.php). المشكلة: خصم المخزون
-        // وإضافة رصيد الصندوق وتسجيل حركة الصندوق كانت تُنفَّذ *دون أي حارس
-        // idempotency* في كل مرة — فإعادة محاولة لفاتورة نجحت فعلياً في
-        // المرة الأولى (لكن انقطع الاتصال قبل أن يستلم العميل الرد) كانت
-        // تُخصِم المخزون وتُضيف للصندوق مرة ثانية لنفس الفاتورة تماماً، رغم
-        // أن الترحيل المحاسبي (post_journal_entry_atomic) محمي بالفعل من
-        // هذا التكرار. الإصلاح: التحقق أولاً هل الفاتورة موجودة فعلياً في
-        // قاعدة البيانات؛ إن كانت موجودة، لا نُعيد تنفيذ أي من آثارها
-        // الجانبية (مخزون/صندوق/محاسبة) — فقط نُعيد نجاحاً فورياً (idempotent
-        // no-op) لأن الفاتورة (وكل آثارها) قد سُجِّلت بالفعل بنجاح.
-        $existsStmt = $pdo->prepare('SELECT 1 FROM invoices WHERE id = ? AND tenant_id = ? LIMIT 1');
-        $existsStmt->execute([$id, $tenantId]);
-        if ($existsStmt->fetchColumn() !== false) {
-            audit("invoice $id (إعادة محاولة متجاهَلة — موجودة بالفعل)", $auth['email'] ?? null, 'info', $tenantId);
-            json_ok(['success' => true, 'id' => $id, 'idempotent' => true]);
-            break;
-        }
-
+        // معرّف الفاتورة هو مفتاح idempotency لإعادة إرسال outbox. يجب أن
+        // يكون الحارس داخل INSERT والمعاملة نفسها؛ ففحص SELECT منفصل يسمح
+        // لطلبين متزامنين بالمرور ثم تكرار خصم المخزون/الصندوق.
         $pdo->beginTransaction();
         try {
-            // ✅ تحويل PostgreSQL: ON DUPLICATE KEY UPDATE → ON CONFLICT DO UPDATE SET
-            // ✅ Multi-Tenant: tenant_id يُدرج في كل فاتورة جديدة؛ ON CONFLICT يبقى
-            // على (id) لأن معرّف الفاتورة (INV-timestamp) غير قابل للتصادم عملياً
-            // بين المتاجر، لكن نُبقي شرط tenant_id في كل التحديثات اللاحقة للأمان.
             $stmt = $pdo->prepare(
                 'INSERT INTO invoices
                  (id, tenant_id, customer_phone, user_email, date, subtotal, discount, tax, total, payment_method, status, items_json, warehouse_id, cash_account_id)
                  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,NULLIF(?, \'\'),NULLIF(?, \'\'))
-                 ON CONFLICT (id) DO UPDATE SET
-                    customer_phone = EXCLUDED.customer_phone,
-                    subtotal = EXCLUDED.subtotal, discount = EXCLUDED.discount,
-                    tax = EXCLUDED.tax, total = EXCLUDED.total,
-                    payment_method = EXCLUDED.payment_method, status = EXCLUDED.status,
-                    items_json = EXCLUDED.items_json,
-                    warehouse_id = EXCLUDED.warehouse_id,
-                    cash_account_id = EXCLUDED.cash_account_id
-                 WHERE invoices.tenant_id = EXCLUDED.tenant_id'
+                 ON CONFLICT (id) DO NOTHING'
             );
             $stmt->execute([
                 $id,
@@ -187,6 +155,36 @@ switch ($method) {
                 $warehouseId,
                 $cashAccountId,
             ]);
+
+            if ($stmt->rowCount() === 0) {
+                $existingStmt = $pdo->prepare(
+                    'SELECT * FROM invoices WHERE tenant_id = ? AND id = ? LIMIT 1'
+                );
+                $existingStmt->execute([$tenantId, $id]);
+                $existing = $existingStmt->fetch();
+                $existingItems = $existing
+                    ? (json_decode($existing['items_json'] ?? '[]', true) ?: [])
+                    : null;
+                $sameItems = $existingItems !== null &&
+                    json_encode($existingItems, JSON_UNESCAPED_UNICODE) ===
+                    json_encode($items, JSON_UNESCAPED_UNICODE);
+                $sameInvoice = $existing && $sameItems &&
+                    (string)($existing['customer_phone'] ?? '') === (string)($body['customer_phone'] ?? '') &&
+                    abs((float)$existing['subtotal'] - (float)($body['subtotal'] ?? 0)) < 0.0001 &&
+                    abs((float)$existing['discount'] - (float)($body['discount'] ?? 0)) < 0.0001 &&
+                    abs((float)$existing['tax'] - (float)($body['tax'] ?? 0)) < 0.0001 &&
+                    abs((float)$existing['total'] - $total) < 0.0001 &&
+                    (string)$existing['payment_method'] === (string)$paymentMethod &&
+                    (string)($existing['warehouse_id'] ?? '') === $warehouseId &&
+                    (string)($existing['cash_account_id'] ?? '') === $cashAccountId;
+                if (!$sameInvoice) {
+                    $pdo->rollBack();
+                    json_error('معرّف الفاتورة مستخدم ببيانات مختلفة', 409);
+                }
+                $pdo->commit();
+                json_ok(['success' => true, 'id' => $id, 'duplicate' => true]);
+                break;
+            }
 
             // تحديث بنود الفاتورة وخصم المخزون (المخزون العام + مخزون المخزن المحدد إن وُجد)
             // ✅ Multi-Tenant: كل تحديث على products/warehouse_stock مقيّد بـ tenant_id
